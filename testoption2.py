@@ -282,13 +282,9 @@ def compute_historical_vrp(daily_iv, daily_rv):
 # OPTION DELTA CALCULATION FUNCTION
 ###########################################
 def compute_delta(row, S):
-    try:
-        expiry_str = row["instrument_name"].split("-")[1]
-        expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
-        expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
-    except Exception:
-        return np.nan
-    T = (expiry_date - row["date_time"]).total_seconds() / (365 * 24 * 3600)
+    expiry_str = row["instrument_name"].split("-")[1]
+    expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
+    T = (expiry_date - row["date_time"]).total_seconds() / 31536000
     if T <= 0:
         T = 0.0001
     K = row["k"]
@@ -299,8 +295,7 @@ def compute_delta(row, S):
         d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
     except Exception:
         return np.nan
-    return norm.cdf(d1) if row["option_type"] == "C" else norm.cdf(d1) - 1
-
+    return norm.cdf(d1) if row["option_type"] == "C" else norm.cdf(d1) - 1    
 ###########################################
 # DELTA-BASED DYNAMIC REGIME FUNCTIONS
 ###########################################
@@ -334,13 +329,9 @@ def classify_regime(row):
         return "Neutral"
 
 def compute_gamma(row, S):
-    try:
-        expiry_str = row["instrument_name"].split("-")[1]
-        expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
-        expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
-    except Exception:
-        return np.nan
-    T = (expiry_date - row["date_time"]).total_seconds() / (365 * 24 * 3600)
+    expiry_str = row["instrument_name"].split("-")[1]
+    expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
+    T = (expiry_date - row["date_time"]).total_seconds() / 31536000  # 365*24*3600
     if T <= 0:
         return np.nan
     K = row["k"]
@@ -353,12 +344,12 @@ def compute_gamma(row, S):
         return np.nan
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
-
+    
 def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    return gamma * oi * (S ** 2) * 0.01
+    return gamma * oi * (S ** 2) 
 
 ###########################################
 # GAMMA & GEX VISUALIZATIONS
@@ -427,7 +418,7 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in atm_strikes.items():
         avg_iv = data["iv_sum"] / data["count"]
-        ev_value = spot_price * (rv - avg_iv) * np.sqrt(2 * T / np.pi)
+        ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV", ascending=False)
