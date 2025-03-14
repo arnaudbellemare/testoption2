@@ -26,7 +26,7 @@ URL_TICKER = f"{BASE_URL}/{TICKER_ENDPOINT}"
 windows = {"7D": "vrp_7d"}
 DEFAULT_EXPIRY_STR = "28MAR25"
 
-# Calculate time to expiry using a default expiry
+# Calculate time to expiry using default expiry
 expiry_date = dt.datetime.strptime(DEFAULT_EXPIRY_STR, "%d%b%y")
 current_date = dt.datetime.now()
 days_to_expiry = (expiry_date - current_date).days
@@ -42,6 +42,7 @@ def params(instrument_name):
         "instrument_name": instrument_name,
     }
 
+# Column names returned by the Thalex API for mark price data
 COLUMNS = [
     "ts",
     "mark_price_open",
@@ -246,7 +247,6 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     """
     if price_data.empty or not {'high', 'low'}.issubset(price_data.columns):
         return np.nan
-    # Use date_time as index if available
     if "date_time" in price_data.columns:
         daily_data = price_data.resample('D', on='date_time').agg({'high': 'max', 'low': 'min'}).dropna()
     else:
@@ -254,10 +254,9 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     if len(daily_data) < window_days:
         return np.nan
     daily_data['log_hl_ratio'] = np.log(daily_data['high'] / daily_data['low'])
-    parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1).apply(
-        lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
+    parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1)\
+        .apply(lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
     annualized_vol = np.sqrt(parkinson_var * annualize_days)
-    # Return values aligned with the original index
     if "date_time" in price_data.columns:
         return annualized_vol.reindex(price_data.index, method='ffill')
     else:
@@ -283,6 +282,7 @@ def compute_daily_average_iv(df_iv_agg):
 
 def compute_historical_vrp(daily_iv, daily_rv):
     n = min(len(daily_iv), len(daily_rv))
+    # VRP defined as the difference in variance (IV^2 - RV^2)
     return [(iv ** 2) - (rv ** 2) for iv, rv in zip(daily_iv[:n], daily_rv[:n])]
 
 ###########################################
@@ -293,8 +293,7 @@ def compute_delta(row, S):
         expiry_str = row["instrument_name"].split("-")[1]
         expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
         # Make expiry_date tz-aware using the same tz as row["date_time"]
-        if row["date_time"].tzinfo is not None:
-            expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
+        expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
     except Exception:
         return np.nan
     T = (expiry_date - row["date_time"]).total_seconds() / (365.25 * 86400)
@@ -367,7 +366,7 @@ def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    # Standard GEX = Gamma * Spot^2 * OpenInterest
+    # Standard GEX = Gamma * Spot^2 * OpenInterest (no arbitrary multiplier)
     return gamma * oi * (S ** 2)
 
 ###########################################
@@ -451,6 +450,12 @@ def classify_vrp_regime(current_vrp, historical_vrps):
 ###########################################
 # EV CALCULATION FUNCTIONS FOR DIFFERENT STRATEGIES
 ###########################################
+# Note: The following EV functions use a variance-difference formula.
+# In our implementation, the EV is computed as:
+#     EV = ((IV² - RV²) * T) / 2
+# We then multiply by 100 to express it as a percentage.
+# (Keep in mind that in many markets the variance risk premium is negative.)
+
 def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv):
     tolerance = spot_price * 0.02  
     atm_candidates = [item for item in ticker_list if abs(item["strike"] - spot_price) <= tolerance]
@@ -467,8 +472,7 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in atm_strikes.items():
         avg_iv = data["iv_sum"] / data["count"]
-        # EV using variance difference formula, expressed as a percentage
-        ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
+        ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100  # Expressed in percentage points
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV (%)", ascending=False)
@@ -571,6 +575,7 @@ def adjust_volatility_with_smile(strike, smile_df):
     sorted_smile = smile_df.sort_values("strike")
     strikes = sorted_smile["strike"].values
     ivs = sorted_smile["iv"].values
+    # Linear interpolation is used here; one may also use cubic spline (see interpolate_iv) if desired.
     adjusted_iv = np.interp(strike, strikes, ivs)
     return adjusted_iv
 
@@ -624,7 +629,7 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
         raw_iv = ticker_data.get("iv", None)
         if raw_iv is None:
             continue
-        # Adjust IV using the observed volatility smile data
+        # Adjust IV using the observed volatility smile
         adjusted_iv = adjust_volatility_with_smile(strike, smile_df)
         try:
             d1 = (np.log(spot / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
@@ -646,19 +651,21 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
 ###########################################
 def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg_reset=None,
                             historical_vols=None, historical_vrps=None, days_to_expiration=7):
+    # Compute realized volatility (RV) and implied volatility (IV) averages
     rv_vol_series = calculate_parkinson_volatility(df_kraken, window_days=7)
     rv_vol = rv_vol_series.iloc[-1] if not rv_vol_series.empty else np.nan
     iv_vol = df["iv_close"].mean() if not df.empty else np.nan
 
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
     iv_var = iv_vol ** 2 if not pd.isna(iv_vol) else np.nan
+    # Variance risk premium (VRP) is defined as the difference between implied and realized variances
     current_vrp = iv_var - rv_var if (not pd.isna(iv_vol) and not pd.isna(rv_vol)) else np.nan
 
     divergence = abs(iv_vol - rv_vol) / rv_vol if (rv_vol != 0 and not pd.isna(iv_vol)) else np.nan
     if not np.isnan(divergence) and divergence > 0.20:
         st.write(f"Alert: IV and RV diverge by {divergence*100:.2f}% (threshold: 20%).")
 
-    # Calculate market regime using rolling mean and std of IV on the time-indexed df_iv_agg
+    # Determine market regime using rolling statistics on IV
     df_iv_agg = df.groupby("date_time")["iv_close"].mean().to_frame(name="iv_mean")
     df_iv_agg.index = pd.to_datetime(df_iv_agg.index)
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
@@ -678,6 +685,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     vol_regime = market_regime
     vrp_regime = classify_vrp_regime(current_vrp, historical_vrps) if historical_vrps and len(historical_vrps) > 0 else "Neutral"
 
+    # Compute average deltas and open interest ratios from the ticker list (global variable 'ticker_list')
     call_items = [item for item in ticker_list if item["option_type"] == "C"]
     put_items = [item for item in ticker_list if item["option_type"] == "P"]
     call_oi_total = sum(item["open_interest"] for item in call_items)
@@ -699,6 +707,9 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     avg_call_gamma = df_calls["gamma"].mean() if not df_calls.empty else 0
     avg_put_gamma = df_puts["gamma"].mean() if not df_puts.empty else 0
 
+    # Trading recommendation is made based on the risk premium regime and risk tolerance.
+    # For example, if VRP is "Long Volatility" (implied variance higher than realized) and risk tolerance is Conservative,
+    # we might recommend buying limited OTM puts to profit from a reversion.
     if vrp_regime == "Long Volatility":
         if risk_tolerance == "Conservative":
             recommendation = "Long Volatility (Conservative): Buy limited OTM Puts"
@@ -749,12 +760,14 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
 # MAIN DASHBOARD
 ###########################################
 def main():
+    # Authenticate user
     login()
-    st.title("Crypto Options Visualization Dashboard (Plotly Version) with Dynamic Volatility Adjustments")
+    st.title("Crypto Options Visualization Dashboard with Dynamic Volatility Adjustments")
     if st.button("Logout"):
         st.session_state.logged_in = False
         st.stop()
-    
+
+    # Expiration date selection
     current_date = dt.datetime.now()
     valid_days = get_valid_expiration_options(current_date)
     selected_day = st.sidebar.selectbox("Choose Expiration Day", options=valid_days)
@@ -766,7 +779,8 @@ def main():
     days_to_expiry = (expiry_date - current_date).days
     T_YEARS = days_to_expiry / 365
     st.sidebar.markdown(f"**Using Expiration Date:** {expiry_str}")
-    
+
+    # Deviation range for filtering instruments
     deviation_option = st.sidebar.select_slider(
         "Choose Deviation Range",
         options=["1 Standard Deviation (68.2%)", "2 Standard Deviations (95.4%)"],
@@ -774,6 +788,7 @@ def main():
     )
     multiplier = 1 if "1 Standard" in deviation_option else 2
 
+    # Fetch Kraken data and compute spot price
     global df_kraken
     df_kraken = fetch_kraken_data()
     if df_kraken.empty:
@@ -781,7 +796,8 @@ def main():
         return
     spot_price = df_kraken["close"].iloc[-1]
     st.write(f"Current BTC/USD Price: {spot_price:.2f}")
-    
+
+    # Fetch and filter instruments from the API
     try:
         filtered_calls, filtered_puts = get_filtered_instruments(spot_price, expiry_str, T_YEARS, multiplier)
     except Exception as e:
@@ -790,29 +806,30 @@ def main():
     st.write("Filtered Call Instruments:", filtered_calls)
     st.write("Filtered Put Instruments:", filtered_puts)
     all_instruments = filtered_calls + filtered_puts
-    
+
+    # Fetch mark price data for options
     df = fetch_data(tuple(all_instruments))
     if df.empty:
         st.error("No data fetched from Thalex. Please check the API or instrument names.")
         return
-    
+
     df_calls = df[df["option_type"] == "C"].copy().sort_values("date_time")
     df_puts = df[df["option_type"] == "P"].copy().sort_values("date_time")
-    
+
+    # Compute implied volatility aggregate statistics
     df_iv_agg = (df.groupby("date_time", as_index=False)["iv_close"]
                  .mean().rename(columns={"iv_close": "iv_mean"}))
     df_iv_agg["date_time"] = pd.to_datetime(df_iv_agg["date_time"])
     df_iv_agg = df_iv_agg.set_index("date_time")
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
-    # Compute rolling mean and std for IV on a time-indexed DataFrame
+    # Compute rolling 1-day mean and std for IV to determine market regime
     df_iv_agg["iv_rolling_mean"] = df_iv_agg["iv_mean"].rolling("1D").mean()
     df_iv_agg["iv_rolling_std"] = df_iv_agg["iv_mean"].rolling("1D").std()
     df_iv_agg["upper_zone"] = df_iv_agg["iv_rolling_mean"] + df_iv_agg["iv_rolling_std"]
     df_iv_agg["lower_zone"] = df_iv_agg["iv_rolling_mean"] - df_iv_agg["iv_rolling_std"]
-    # Reset index for plotting if needed
     df_iv_agg_reset = df_iv_agg.reset_index()
 
-    # Build preliminary ticker list with raw IV values
+    # Build preliminary ticker list (using raw IV)
     preliminary_ticker_list = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
@@ -834,15 +851,15 @@ def main():
             "iv": raw_iv
         })
     smile_df = build_smile_df(preliminary_ticker_list)
-    
-    # Rebuild ticker list using dynamic volatility adjustment based on the observed smile
+
+    # Rebuild ticker list using dynamic volatility adjustment based on the smile
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
-    
+
     daily_rv = compute_daily_realized_volatility(df_kraken)
     daily_iv = compute_daily_average_iv(df_iv_agg)
     historical_vrps = compute_historical_vrp(daily_iv, daily_rv)
-    
+
     st.subheader("Volatility Trading Decision Tool")
     risk_tolerance = st.sidebar.selectbox("Risk Tolerance",
                                           options=["Conservative", "Moderate", "Aggressive"],
@@ -853,22 +870,22 @@ def main():
         historical_vrps=historical_vrps,
         days_to_expiration=days_to_expiry
     )
-    
+
     st.write("### Market and Volatility Metrics")
     st.write(f"Implied Volatility (IV): {trade_decision['iv']:.2%}")
     st.write(f"Realized Volatility (RV): {trade_decision['rv']:.2%}")
-    st.write(f"Volatility Regime: {trade_decision['vol_regime']}")
+    st.write(f"Market Regime: {trade_decision['vol_regime']}")
     st.write(f"VRP Regime: {trade_decision['vrp_regime']}")
     st.write(f"Put/Call Open Interest Ratio: {trade_decision['put_call_ratio']:.2f}")
     st.write(f"Average Call Delta: {trade_decision['avg_call_delta']:.4f}")
     st.write(f"Average Put Delta: {trade_decision['avg_put_delta']:.4f}")
     st.write(f"Average Gamma: {trade_decision['avg_call_gamma']:.6f}")
-   
+
     st.subheader("Trading Recommendation")
     st.write(f"**Recommendation:** {trade_decision['recommendation']}")
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
-    
+
     # EV Analysis: Use the appropriate EV function based on recommended position.
     rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
@@ -895,7 +912,7 @@ def main():
         df_ev = None
         st.subheader("EV Analysis")
         st.write("EV analysis for the selected position is not implemented yet.")
-    
+
     if df_ev is not None and not df_ev.empty and not df_ev["EV (%)"].isna().all():
         df_ev_clean = df_ev.dropna(subset=["EV (%)"])
         if not df_ev_clean.empty:
@@ -908,12 +925,12 @@ def main():
             st.write("No candidates found with valid EV values.")
     else:
         st.write("No candidates found within tolerance for EV calculation.")
-    
+
     if st.button("Simulate Trade"):
         st.write("Simulating trade based on recommendation...")
         st.write("Position Size: Adjust based on capital (e.g., 1-5% of portfolio for chosen risk tolerance)")
         st.write("Monitor price and volatility in real-time and adjust hedges dynamically.")
-    
+
     if not df_calls.empty and not df_puts.empty:
         df_calls["gamma"] = df_calls.apply(lambda row: compute_gamma(row, spot_price), axis=1)
         df_puts["gamma"] = df_puts.apply(lambda row: compute_gamma(row, spot_price), axis=1)
@@ -934,7 +951,7 @@ def main():
         fig_vol_smile.update_layout(height=400, width=600)
         st.plotly_chart(fig_vol_smile, use_container_width=True)
         plot_gamma_heatmap(pd.concat([df_calls, df_puts]))
-    
+
     gex_data = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
