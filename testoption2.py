@@ -282,8 +282,14 @@ def compute_historical_vrp(daily_iv, daily_rv):
 # OPTION DELTA CALCULATION FUNCTION
 ###########################################
 def compute_delta(row, S):
-    expiry_str = row["instrument_name"].split("-")[1]
-    expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
+    try:
+        expiry_str = row["instrument_name"].split("-")[1]
+        expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
+        # Make expiry_date tz-aware using the same tz as row["date_time"]
+        if row["date_time"].tzinfo is not None:
+            expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
+    except Exception:
+        return np.nan
     T = (expiry_date - row["date_time"]).total_seconds() / 31536000
     if T <= 0:
         T = 0.0001
@@ -295,7 +301,8 @@ def compute_delta(row, S):
         d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
     except Exception:
         return np.nan
-    return norm.cdf(d1) if row["option_type"] == "C" else norm.cdf(d1) - 1    
+    return norm.cdf(d1) if row["option_type"] == "C" else norm.cdf(d1) - 1
+
 ###########################################
 # DELTA-BASED DYNAMIC REGIME FUNCTIONS
 ###########################################
@@ -329,9 +336,14 @@ def classify_regime(row):
         return "Neutral"
 
 def compute_gamma(row, S):
-    expiry_str = row["instrument_name"].split("-")[1]
-    expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
-    T = (expiry_date - row["date_time"]).total_seconds() / 31536000  # 365*24*3600
+    try:
+        expiry_str = row["instrument_name"].split("-")[1]
+        expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
+        if row["date_time"].tzinfo is not None:
+            expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
+    except Exception:
+        return np.nan
+    T = (expiry_date - row["date_time"]).total_seconds() / 31536000
     if T <= 0:
         return np.nan
     K = row["k"]
@@ -344,12 +356,13 @@ def compute_gamma(row, S):
         return np.nan
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
-    
+
 def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    return gamma * oi * (S ** 2) 
+    # Standard GEX = Gamma * Spot^2 * OpenInterest (no arbitrary multiplier)
+    return gamma * oi * (S ** 2)
 
 ###########################################
 # GAMMA & GEX VISUALIZATIONS
@@ -418,6 +431,7 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in atm_strikes.items():
         avg_iv = data["iv_sum"] / data["count"]
+        # Correct EV formula using variance difference: ((IV^2 - RV^2)*T)/2
         ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
@@ -439,7 +453,8 @@ def calculate_limited_otm_put_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
-        ev_value = spot_price * (avg_iv - rv) * np.sqrt(2 * T / np.pi)
+        # For Limited OTM Puts, you may use a different EV formula. Here we use the variance difference approach.
+        ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV", ascending=False)
@@ -460,7 +475,7 @@ def calculate_call_spread_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
-        ev_value = spot_price * (avg_iv - rv) * np.sqrt(2 * T / np.pi)
+        ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV", ascending=False)
@@ -482,7 +497,7 @@ def calculate_strangle_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
-        ev_value = spot_price * abs(avg_iv - rv) * np.sqrt(2 * T / np.pi)
+        ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV", ascending=False)
@@ -502,7 +517,7 @@ def calculate_naked_call_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
-        ev_value = spot_price * (avg_iv - rv) * np.sqrt(2 * T / np.pi)
+        ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV", ascending=False)
@@ -528,14 +543,8 @@ def adjust_volatility_with_smile(strike, smile_df):
 # BUILD SMILE DATAFRAME FROM TICKER LIST
 ###########################################
 def build_smile_df(ticker_list):
-    """
-    Build a volatility smile DataFrame from the ticker list.
-    Group by strike and compute the average IV.
-    """
     df = pd.DataFrame(ticker_list)
-    # Ensure we only include entries with valid IV values
     df = df.dropna(subset=["iv"])
-    # Group by strike and compute average IV
     smile_df = df.groupby("strike", as_index=False)["iv"].mean()
     return smile_df
 
@@ -556,7 +565,6 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
         raw_iv = ticker_data.get("iv", None)
         if raw_iv is None:
             continue
-        # Use the actual volatility smile data to adjust IV
         adjusted_iv = adjust_volatility_with_smile(strike, smile_df)
         try:
             d1 = (np.log(spot / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
@@ -721,8 +729,7 @@ def main():
     df_iv_agg["market_regime"] = np.where(df_iv_agg["iv_mean"] > df_iv_agg["rolling_mean"], "Risk-Off", "Risk-On")
     df_iv_agg_reset = df_iv_agg.reset_index()
 
-    # Build the volatility smile from the ticker list (using raw IV from each option)
-    # First, build a preliminary ticker list with raw IV values
+    # Build the volatility smile from the ticker list using raw IV
     preliminary_ticker_list = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
@@ -743,10 +750,9 @@ def main():
             "open_interest": ticker_data["open_interest"],
             "iv": raw_iv
         })
-    # Build the smile DataFrame from the preliminary ticker list
     smile_df = build_smile_df(preliminary_ticker_list)
     
-    # Now, rebuild the ticker list using the observed volatility smile for adjustment
+    # Rebuild ticker list using dynamic volatility adjustment based on the smile data
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
     
@@ -776,7 +782,7 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
     
-    # EV Analysis: Use appropriate EV function based on the recommended position.
+    # EV Analysis: Use appropriate EV function based on recommended position.
     rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
