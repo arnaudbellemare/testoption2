@@ -201,7 +201,8 @@ def fetch_data(instruments_tuple):
         .assign(date_time=lambda df: pd.to_datetime(df["ts"], unit="s")
                 .dt.tz_localize("UTC")
                 .dt.tz_convert("America/New_York"))
-        .assign(k=lambda df: df["instrument_name"].map(lambda s: int(s.split("-")[2]) if len(s.split("-")) >= 3 and s.split("-")[2].isdigit() else np.nan))
+        .assign(k=lambda df: df["instrument_name"].map(lambda s: int(s.split("-")[2])
+                                                      if len(s.split("-")) >= 3 and s.split("-")[2].isdigit() else np.nan))
         .assign(option_type=lambda df: df["instrument_name"].str.split("-").str[-1])
     )
     return df
@@ -245,6 +246,7 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     """
     if price_data.empty or not {'high', 'low'}.issubset(price_data.columns):
         return np.nan
+    # Use date_time as index if available
     if "date_time" in price_data.columns:
         daily_data = price_data.resample('D', on='date_time').agg({'high': 'max', 'low': 'min'}).dropna()
     else:
@@ -255,6 +257,7 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1).apply(
         lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
     annualized_vol = np.sqrt(parkinson_var * annualize_days)
+    # Return values aligned with the original index
     if "date_time" in price_data.columns:
         return annualized_vol.reindex(price_data.index, method='ffill')
     else:
@@ -289,7 +292,9 @@ def compute_delta(row, S):
     try:
         expiry_str = row["instrument_name"].split("-")[1]
         expiry_date = dt.datetime.strptime(expiry_str, "%d%b%y")
-        expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
+        # Make expiry_date tz-aware using the same tz as row["date_time"]
+        if row["date_time"].tzinfo is not None:
+            expiry_date = expiry_date.replace(tzinfo=row["date_time"].tzinfo)
     except Exception:
         return np.nan
     T = (expiry_date - row["date_time"]).total_seconds() / (365.25 * 86400)
@@ -362,7 +367,7 @@ def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    # Standard GEX = Gamma * Spot^2 * OpenInterest (no arbitrary multiplier)
+    # Standard GEX = Gamma * Spot^2 * OpenInterest
     return gamma * oi * (S ** 2)
 
 ###########################################
@@ -619,6 +624,7 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
         raw_iv = ticker_data.get("iv", None)
         if raw_iv is None:
             continue
+        # Adjust IV using the observed volatility smile data
         adjusted_iv = adjust_volatility_with_smile(strike, smile_df)
         try:
             d1 = (np.log(spot / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
@@ -652,24 +658,24 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     if not np.isnan(divergence) and divergence > 0.20:
         st.write(f"Alert: IV and RV diverge by {divergence*100:.2f}% (threshold: 20%).")
 
-    # Market regime using rolling mean and std of IV
-    # Calculate rolling 1-day mean and standard deviation for IV
-    df_iv_agg_reset["iv_rolling_mean"] = df_iv_agg_reset["iv_mean"].rolling("1D").mean()
-    df_iv_agg_reset["iv_rolling_std"] = df_iv_agg_reset["iv_mean"].rolling("1D").std()
-    df_iv_agg_reset["upper_zone"] = df_iv_agg_reset["iv_rolling_mean"] + df_iv_agg_reset["iv_rolling_std"]
-    df_iv_agg_reset["lower_zone"] = df_iv_agg_reset["iv_rolling_mean"] - df_iv_agg_reset["iv_rolling_std"]
-    # Use the latest IV value to determine regime
-    latest_iv = df_iv_agg_reset["iv_mean"].iloc[-1]
-    latest_upper = df_iv_agg_reset["upper_zone"].iloc[-1]
-    latest_lower = df_iv_agg_reset["lower_zone"].iloc[-1]
+    # Calculate market regime using rolling mean and std of IV on the time-indexed df_iv_agg
+    df_iv_agg = df.groupby("date_time")["iv_close"].mean().to_frame(name="iv_mean")
+    df_iv_agg.index = pd.to_datetime(df_iv_agg.index)
+    df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
+    df_iv_agg["iv_rolling_mean"] = df_iv_agg["iv_mean"].rolling("1D").mean()
+    df_iv_agg["iv_rolling_std"] = df_iv_agg["iv_mean"].rolling("1D").std()
+    df_iv_agg["upper_zone"] = df_iv_agg["iv_rolling_mean"] + df_iv_agg["iv_rolling_std"]
+    df_iv_agg["lower_zone"] = df_iv_agg["iv_rolling_mean"] - df_iv_agg["iv_rolling_std"]
+    latest_iv = df_iv_agg["iv_mean"].iloc[-1]
+    latest_upper = df_iv_agg["upper_zone"].iloc[-1]
+    latest_lower = df_iv_agg["lower_zone"].iloc[-1]
     if latest_iv > latest_upper:
         market_regime = "Risk-Off"
     elif latest_iv < latest_lower:
         market_regime = "Risk-On"
     else:
         market_regime = "Neutral"
-
-    vol_regime = market_regime  # Replace previous regime calculation
+    vol_regime = market_regime
     vrp_regime = classify_vrp_regime(current_vrp, historical_vrps) if historical_vrps and len(historical_vrps) > 0 else "Neutral"
 
     call_items = [item for item in ticker_list if item["option_type"] == "C"]
@@ -761,9 +767,11 @@ def main():
     T_YEARS = days_to_expiry / 365
     st.sidebar.markdown(f"**Using Expiration Date:** {expiry_str}")
     
-    deviation_option = st.sidebar.select_slider("Choose Deviation Range",
-                                                  options=["1 Standard Deviation (68.2%)", "2 Standard Deviations (95.4%)"],
-                                                  value="1 Standard Deviation (68.2%)")
+    deviation_option = st.sidebar.select_slider(
+        "Choose Deviation Range",
+        options=["1 Standard Deviation (68.2%)", "2 Standard Deviations (95.4%)"],
+        value="1 Standard Deviation (68.2%)"
+    )
     multiplier = 1 if "1 Standard" in deviation_option else 2
 
     global df_kraken
@@ -796,11 +804,12 @@ def main():
     df_iv_agg["date_time"] = pd.to_datetime(df_iv_agg["date_time"])
     df_iv_agg = df_iv_agg.set_index("date_time")
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
-    # Calculate rolling IV mean and std for market regime determination
+    # Compute rolling mean and std for IV on a time-indexed DataFrame
     df_iv_agg["iv_rolling_mean"] = df_iv_agg["iv_mean"].rolling("1D").mean()
     df_iv_agg["iv_rolling_std"] = df_iv_agg["iv_mean"].rolling("1D").std()
     df_iv_agg["upper_zone"] = df_iv_agg["iv_rolling_mean"] + df_iv_agg["iv_rolling_std"]
     df_iv_agg["lower_zone"] = df_iv_agg["iv_rolling_mean"] - df_iv_agg["iv_rolling_std"]
+    # Reset index for plotting if needed
     df_iv_agg_reset = df_iv_agg.reset_index()
 
     # Build preliminary ticker list with raw IV values
@@ -860,7 +869,7 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
     
-    # EV Analysis: Use appropriate EV function based on recommended position.
+    # EV Analysis: Use the appropriate EV function based on recommended position.
     rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
