@@ -10,9 +10,9 @@ import plotly.graph_objects as go
 from scipy.stats import norm, percentileofscore
 import math
 
-# -------------------------------
+###########################################
 # Thalex API details
-# -------------------------------
+###########################################
 BASE_URL = "https://thalex.com/api/v2/public"
 instruments_endpoint = "instruments"  # Endpoint for fetching available instruments
 url_instruments = f"{BASE_URL}/{instruments_endpoint}"
@@ -242,9 +242,9 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     if price_data.empty or not {'high', 'low'}.issubset(price_data.columns):
         return np.nan
     if "date_time" in price_data.columns:
-        daily_data = price_data.resample('D', on='date_time').agg({'high': 'max','low': 'min'}).dropna()
+        daily_data = price_data.resample('D', on='date_time').agg({'high': 'max', 'low': 'min'}).dropna()
     else:
-        daily_data = price_data.resample('D').agg({'high': 'max','low': 'min'}).dropna()
+        daily_data = price_data.resample('D').agg({'high': 'max', 'low': 'min'}).dropna()
     if len(daily_data) < window_days:
         return np.nan
     daily_data['log_hl_ratio'] = np.log(daily_data['high'] / daily_data['low'])
@@ -258,9 +258,9 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
 
 def compute_daily_realized_volatility(df):
     if 'date_time' in df.columns:
-        df_daily = df.resample('D', on='date_time').agg({'high': 'max','low': 'min'}).dropna()
+        df_daily = df.resample('D', on='date_time').agg({'high': 'max', 'low': 'min'}).dropna()
     else:
-        df_daily = df.resample('D').agg({'high': 'max','low': 'min'}).dropna()
+        df_daily = df.resample('D').agg({'high': 'max', 'low': 'min'}).dropna()
     daily_vols = []
     for i in range(1, len(df_daily) + 1):
         window = df_daily.iloc[max(0, i - 7):i]
@@ -520,6 +520,69 @@ def calculate_small_atm_straddle_ev(ticker_list, spot_price, T, rv):
     return calculate_atm_straddle_ev(ticker_list, spot_price, T, rv)
 
 ###########################################
+# DYNAMIC VOLATILITY ADJUSTMENT USING VOLATILITY SMILE
+###########################################
+def adjust_volatility_with_smile(strike, smile_df):
+    """
+    Adjust the implied volatility for a given strike based on the observed volatility smile.
+    The smile_df DataFrame must contain 'strike' and 'iv' columns.
+    """
+    sorted_smile = smile_df.sort_values("strike")
+    strikes = sorted_smile["strike"].values
+    ivs = sorted_smile["iv"].values
+    adjusted_iv = np.interp(strike, strikes, ivs)
+    return adjusted_iv
+
+###########################################
+# BUILD SMILE DATAFRAME FROM TICKER LIST
+###########################################
+def build_smile_df(ticker_list):
+    """
+    Build a volatility smile DataFrame from the ticker list.
+    Group by strike and compute the average IV.
+    """
+    df = pd.DataFrame(ticker_list)
+    # Ensure we only include entries with valid IV values
+    df = df.dropna(subset=["iv"])
+    # Group by strike and compute average IV
+    smile_df = df.groupby("strike", as_index=False)["iv"].mean()
+    return smile_df
+
+###########################################
+# TICKER LIST BUILDER WITH SMILE ADJUSTMENT
+###########################################
+def build_ticker_list(all_instruments, spot, T, smile_df):
+    ticker_list = []
+    for instrument in all_instruments:
+        ticker_data = fetch_ticker(instrument)
+        if not (ticker_data and "open_interest" in ticker_data):
+            continue
+        try:
+            strike = int(instrument.split("-")[2])
+        except Exception:
+            continue
+        option_type = instrument.split("-")[-1]
+        raw_iv = ticker_data.get("iv", None)
+        if raw_iv is None:
+            continue
+        # Use the actual volatility smile data to adjust IV
+        adjusted_iv = adjust_volatility_with_smile(strike, smile_df)
+        try:
+            d1 = (np.log(spot / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
+        except Exception:
+            continue
+        delta_est = norm.cdf(d1) if option_type == "C" else norm.cdf(d1) - 1
+        ticker_list.append({
+            "instrument": instrument,
+            "strike": strike,
+            "option_type": option_type,
+            "open_interest": ticker_data["open_interest"],
+            "delta": delta_est,
+            "iv": adjusted_iv
+        })
+    return ticker_list
+
+###########################################
 # UPDATED TRADE STRATEGY EVALUATION
 ###########################################
 def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg_reset=None,
@@ -624,8 +687,8 @@ def main():
         st.error("Expiration date is invalid or already passed")
         st.stop()
     expiry_str = expiry_date.strftime("%d%b%y").upper()
-    days_to_expiration = (expiry_date - current_date).days
-    T_YEARS = days_to_expiration / 365
+    days_to_expiry = (expiry_date - current_date).days
+    T_YEARS = days_to_expiry / 365
     st.sidebar.markdown(f"**Using Expiration Date:** {expiry_str}")
     
     deviation_option = st.sidebar.select_slider("Choose Deviation Range",
@@ -667,42 +730,34 @@ def main():
     df_iv_agg["market_regime"] = np.where(df_iv_agg["iv_mean"] > df_iv_agg["rolling_mean"], "Risk-Off", "Risk-On")
     df_iv_agg_reset = df_iv_agg.reset_index()
 
-    global ticker_list
-    ticker_list = []
-    # Build ticker list using adjusted volatility
+    # Build the volatility smile from the ticker list (using raw IV from each option)
+    # First, build a preliminary ticker list with raw IV values
+    preliminary_ticker_list = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
-        if ticker_data and "open_interest" in ticker_data:
-            oi = ticker_data["open_interest"]
-        else:
+        if not (ticker_data and "open_interest" in ticker_data):
             continue
         try:
             strike = int(instrument.split("-")[2])
         except Exception:
             continue
         option_type = instrument.split("-")[-1]
-        iv_val = ticker_data.get("iv", None)
-        if iv_val is None:
+        raw_iv = ticker_data.get("iv", None)
+        if raw_iv is None:
             continue
-        T = T_YEARS
-        # Adjust volatility based on moneyness
-        if option_type == "C":
-            adjusted_iv = iv_val * 1.10 if strike > spot_price else iv_val
-        else:
-            adjusted_iv = iv_val * 1.15 if strike < spot_price else iv_val
-        try:
-            d1 = (np.log(spot_price / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
-        except Exception:
-            continue
-        delta_est = norm.cdf(d1) if option_type == "C" else norm.cdf(d1) - 1
-        ticker_list.append({
+        preliminary_ticker_list.append({
             "instrument": instrument,
             "strike": strike,
             "option_type": option_type,
-            "open_interest": oi,
-            "delta": delta_est,
-            "iv": adjusted_iv
+            "open_interest": ticker_data["open_interest"],
+            "iv": raw_iv
         })
+    # Build the smile DataFrame from the preliminary ticker list
+    smile_df = build_smile_df(preliminary_ticker_list)
+    
+    # Now, rebuild the ticker list using the observed volatility smile for adjustment
+    global ticker_list
+    ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
     
     daily_rv = compute_daily_realized_volatility(df_kraken)
     daily_iv = compute_daily_average_iv(df_iv_agg)
@@ -713,7 +768,7 @@ def main():
     trade_decision = evaluate_trade_strategy(df, spot_price, risk_tolerance, df_iv_agg_reset,
                                                historical_vols=daily_rv,
                                                historical_vrps=historical_vrps,
-                                               days_to_expiration=days_to_expiration)
+                                               days_to_expiration=days_to_expiry)
     
     st.write("### Market and Volatility Metrics")
     st.write(f"Implied Volatility (IV): {trade_decision['iv']:.2%}")
@@ -725,7 +780,7 @@ def main():
     st.write(f"Average Put Delta: {trade_decision['avg_put_delta']:.4f}")
     st.write(f"Average Gamma: {trade_decision['avg_call_gamma']:.6f}")
     
-    st.write("### Trading Recommendation")
+    st.subheader("Trading Recommendation")
     st.write(f"**Recommendation:** {trade_decision['recommendation']}")
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
@@ -780,14 +835,14 @@ def main():
         df_puts["gamma"] = df_puts.apply(lambda row: compute_gamma(row, spot_price), axis=1)
     st.subheader("Volatility Smile at Latest Timestamp")
     latest_ts = df["date_time"].max()
-    smile_df = df[df["date_time"] == latest_ts]
-    if not smile_df.empty:
-        atm_strike = smile_df.loc[smile_df["mark_price_close"].idxmax(), "k"]
-        smile_df = smile_df.sort_values(by="k")
-        fig_vol_smile = px.line(smile_df, x="k", y="iv_close", markers=True,
+    smile_df_latest = df[df["date_time"] == latest_ts]
+    if not smile_df_latest.empty:
+        atm_strike = smile_df_latest.loc[smile_df_latest["mark_price_close"].idxmax(), "k"]
+        smile_df_latest = smile_df_latest.sort_values(by="k")
+        fig_vol_smile = px.line(smile_df_latest, x="k", y="iv_close", markers=True,
                                 title=f"Volatility Smile at {latest_ts.strftime('%d %b %H:%M')}",
                                 labels={"iv_close": "IV", "k": "Strike"})
-        cheap_hedge_strike = smile_df.loc[smile_df["iv_close"].idxmin(), "k"]
+        cheap_hedge_strike = smile_df_latest.loc[smile_df_latest["iv_close"].idxmin(), "k"]
         fig_vol_smile.add_vline(x=cheap_hedge_strike, line=dict(dash="dash", color="green"),
                                 annotation_text=f"Cheap Hedge ({cheap_hedge_strike})", annotation_position="top")
         fig_vol_smile.add_vline(x=spot_price, line=dict(dash="dash", color="blue"),
