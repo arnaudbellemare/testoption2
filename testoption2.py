@@ -254,8 +254,8 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     if len(daily_data) < window_days:
         return np.nan
     daily_data['log_hl_ratio'] = np.log(daily_data['high'] / daily_data['low'])
-    parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1)\
-        .apply(lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
+    parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1).apply(
+        lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
     annualized_vol = np.sqrt(parkinson_var * annualize_days)
     if "date_time" in price_data.columns:
         return annualized_vol.reindex(price_data.index, method='ffill')
@@ -341,6 +341,24 @@ def classify_regime(row):
     else:
         return "Neutral"
 
+# IMPORTANT: Make sure to define classify_vrp_regime
+def classify_vrp_regime(current_vrp, historical_vrps):
+    """
+    Classify the Variance Risk Premium regime based on the percentile of the current VRP among historical values.
+    If current_vrp is negative, we interpret it as a "Long Volatility" regime.
+    Otherwise, if the percentile is high (above 75), it's a "Short Volatility" regime;
+    if low (below 25), it's a "Long Volatility" regime; else "Neutral".
+    """
+    percentile = percentileofscore(historical_vrps, current_vrp)
+    if current_vrp < 0:
+        return "Long Volatility"
+    elif percentile > 75:
+        return "Short Volatility"
+    elif percentile < 25:
+        return "Long Volatility"
+    else:
+        return "Neutral"
+
 def compute_gamma(row, S):
     try:
         expiry_str = row["instrument_name"].split("-")[1]
@@ -374,10 +392,10 @@ def compute_gex(row, S, oi):
 ###########################################
 def compute_ev(avg_iv, rv, T, position_side="short"):
     """
-    Compute the expected variance premium EV using the variance-difference formula.
+    Compute the expected variance premium (EV) using the variance-difference formula.
     For a short volatility position (e.g., selling variance), the formula is:
-      EV = ((IV^2 - RV^2) * T) / 2 * 100
-    For a long volatility position (e.g., buying options), flip the sign.
+        EV = ((avg_iv^2 - rv^2) * T) / 2 * 100
+    For a long volatility position (e.g., buying options), the sign is flipped.
     """
     ev = ((avg_iv**2 - rv**2) * T) / 2 * 100
     if position_side == "long":
@@ -388,7 +406,7 @@ def compute_ev(avg_iv, rv, T, position_side="short"):
 # EV CALCULATION FUNCTIONS FOR DIFFERENT STRATEGIES
 ###########################################
 def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For an ATM straddle, the trade is typically long volatility.
+    # For an ATM straddle EV analysis
     tolerance = spot_price * 0.02  
     atm_candidates = [item for item in ticker_list if abs(item["strike"] - spot_price) <= tolerance]
     if not atm_candidates:
@@ -410,7 +428,7 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side="sho
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_limited_otm_put_ev(ticker_list, spot_price, T, rv, position_side="long"):
-    # For limited OTM puts (long volatility), use the flipped sign.
+    # For limited OTM puts, typically a long volatility trade (flip sign)
     tolerance = spot_price * 0.10  
     candidates = [item for item in ticker_list if item["option_type"] == "P" and item["strike"] < spot_price and (spot_price - item["strike"]) <= tolerance]
     if not candidates:
@@ -432,7 +450,7 @@ def calculate_limited_otm_put_ev(ticker_list, spot_price, T, rv, position_side="
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_call_spread_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For call spreads (short volatility), use the standard sign.
+    # For call spreads (short volatility)
     tolerance = spot_price * 0.10  
     candidates = [item for item in ticker_list if item["option_type"] == "C" and item["strike"] > spot_price and (item["strike"] - spot_price) <= tolerance]
     if not candidates:
@@ -454,7 +472,7 @@ def calculate_call_spread_ev(ticker_list, spot_price, T, rv, position_side="shor
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_strangle_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For strangles, both OTM calls and puts are considered.
+    # For strangles, include both OTM calls and puts.
     tolerance = spot_price * 0.10  
     candidates = [item for item in ticker_list if ((item["option_type"] == "C" and item["strike"] > spot_price and (item["strike"] - spot_price) <= tolerance)
                                                      or (item["option_type"] == "P" and item["strike"] < spot_price and (spot_price - item["strike"]) <= tolerance))]
@@ -477,7 +495,7 @@ def calculate_strangle_ev(ticker_list, spot_price, T, rv, position_side="short")
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_naked_call_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For naked calls (short volatility), use the standard sign.
+    # For naked calls (short volatility)
     candidates = [item for item in ticker_list if item["option_type"] == "C" and item["strike"] > spot_price]
     if not candidates:
         return None
@@ -498,7 +516,7 @@ def calculate_naked_call_ev(ticker_list, spot_price, T, rv, position_side="short
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_small_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side="long"):
-    # For small ATM straddles, we use the same as ATM straddle EV.
+    # For small ATM straddles, use the same EV calculation as for ATM straddles.
     return calculate_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side)
 
 ###########################################
@@ -512,7 +530,6 @@ def adjust_volatility_with_smile(strike, smile_df):
     sorted_smile = smile_df.sort_values("strike")
     strikes = sorted_smile["strike"].values
     ivs = sorted_smile["iv"].values
-    # Linear interpolation is used here.
     adjusted_iv = np.interp(strike, strikes, ivs)
     return adjusted_iv
 
@@ -595,14 +612,14 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
 
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
     iv_var = iv_vol ** 2 if not pd.isna(iv_vol) else np.nan
-    # Variance risk premium: difference in variances (IV² - RV²)
+    # Variance risk premium (VRP) defined as IV² - RV²
     current_vrp = iv_var - rv_var if (not pd.isna(iv_vol) and not pd.isna(rv_vol)) else np.nan
 
     divergence = abs(iv_vol - rv_vol) / rv_vol if (rv_vol != 0 and not pd.isna(iv_vol)) else np.nan
     if not np.isnan(divergence) and divergence > 0.20:
         st.write(f"Alert: IV and RV diverge by {divergence*100:.2f}% (threshold: 20%).")
 
-    # Determine market regime using rolling statistics on IV
+    # Determine market regime using rolling IV statistics
     df_iv_agg = df.groupby("date_time")["iv_close"].mean().to_frame(name="iv_mean")
     df_iv_agg.index = pd.to_datetime(df_iv_agg.index)
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
@@ -622,7 +639,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     vol_regime = market_regime
     vrp_regime = classify_vrp_regime(current_vrp, historical_vrps) if historical_vrps and len(historical_vrps) > 0 else "Neutral"
 
-    # Compute average deltas and open interest ratios from ticker_list (global variable)
+    # Compute average delta and open interest statistics from ticker_list (global variable)
     call_items = [item for item in ticker_list if item["option_type"] == "C"]
     put_items = [item for item in ticker_list if item["option_type"] == "P"]
     call_oi_total = sum(item["open_interest"] for item in call_items)
@@ -644,8 +661,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     avg_call_gamma = df_calls["gamma"].mean() if not df_calls.empty else 0
     avg_put_gamma = df_puts["gamma"].mean() if not df_puts.empty else 0
 
-    # Trading Recommendation: This is rule-based based on the variance risk premium regime (vrp_regime)
-    # and the user's risk tolerance.
+    # Trading Recommendation: Based on the VRP regime and user risk tolerance.
     if vrp_regime == "Long Volatility":
         if risk_tolerance == "Conservative":
             recommendation = "Long Volatility (Conservative): Buy limited OTM Puts"
@@ -758,14 +774,14 @@ def main():
     df_iv_agg["date_time"] = pd.to_datetime(df_iv_agg["date_time"])
     df_iv_agg = df_iv_agg.set_index("date_time")
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
-    # Rolling 1-day IV statistics for regime determination
+    # Compute rolling IV statistics for market regime determination
     df_iv_agg["iv_rolling_mean"] = df_iv_agg["iv_mean"].rolling("1D").mean()
     df_iv_agg["iv_rolling_std"] = df_iv_agg["iv_mean"].rolling("1D").std()
     df_iv_agg["upper_zone"] = df_iv_agg["iv_rolling_mean"] + df_iv_agg["iv_rolling_std"]
     df_iv_agg["lower_zone"] = df_iv_agg["iv_rolling_mean"] - df_iv_agg["iv_rolling_std"]
     df_iv_agg_reset = df_iv_agg.reset_index()
 
-    # Build preliminary ticker list using raw IV data
+    # Build preliminary ticker list with raw IV values
     preliminary_ticker_list = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
@@ -788,7 +804,7 @@ def main():
         })
     smile_df = build_smile_df(preliminary_ticker_list)
 
-    # Rebuild ticker list using dynamic volatility adjustment
+    # Rebuild ticker list using dynamic volatility adjustment based on the observed smile
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
 
@@ -824,7 +840,7 @@ def main():
 
     # Set EV sign based on the recommended position:
     # For long volatility positions (e.g., Limited OTM Puts, ATM Straddle, Leveraged Long Straddle),
-    # we want the EV function to flip the sign.
+    # flip the EV sign.
     if trade_decision["position"] in ["Limited OTM Puts", "ATM Straddle", "Leveraged Long Straddle"]:
         position_side = "long"
     else:
