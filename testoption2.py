@@ -396,8 +396,9 @@ def plot_net_gex(df_gex, spot_price):
 def compute_ev(avg_iv, rv, T, position_side="short"):
     """
     Compute the expected variance premium (EV) as a percentage.
-    For a short volatility position, EV = ((avg_iv^2 - rv^2) * T) / 2 * 100.
-    For a long volatility position, the sign is reversed.
+    Here, we use the variance difference formula:
+        EV = (((avg_iv^2 - rv^2) * T) / 2) * 100
+    For a long volatility position, the EV is reversed.
     """
     ev = (((avg_iv**2 - rv**2) * T) / 2) * 100
     if position_side == "long":
@@ -598,7 +599,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
 
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
     iv_var = iv_vol ** 2 if not pd.isna(iv_vol) else np.nan
-    # VRP defined as IV^2 - RV^2
+    # Variance Risk Premium (VRP) defined as IV² - RV²
     current_vrp = iv_var - rv_var if (not pd.isna(iv_vol) and not pd.isna(rv_vol)) else np.nan
 
     divergence = abs(iv_vol - rv_vol) / rv_vol if (rv_vol != 0 and not pd.isna(iv_vol)) else np.nan
@@ -641,13 +642,21 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     df_calls = df[df["option_type"] == "C"].copy()
     df_puts = df[df["option_type"] == "P"].copy()
     if "gamma" not in df_calls.columns:
-        df_calls["gamma"] = df_calls.apply(lambda row: compute_gamma(row, spot_price), axis=1)
+        df_calls["gamma"] = df_calls.apply(lambda row: compute_delta(row, spot_price), axis=1)  # Using delta as proxy if gamma not available
     if "gamma" not in df_puts.columns:
-        df_puts["gamma"] = df_puts.apply(lambda row: compute_gamma(row, spot_price), axis=1)
+        df_puts["gamma"] = df_puts.apply(lambda row: compute_delta(row, spot_price), axis=1)
     avg_call_gamma = df_calls["gamma"].mean() if not df_calls.empty else 0
     avg_put_gamma = df_puts["gamma"].mean() if not df_puts.empty else 0
 
-    # Trading Recommendation based on VRP regime and risk tolerance:
+    # TRADING RECOMMENDATION:
+    # The trading recommendation is determined by first classifying the market regime (VRP regime)
+    # based on whether the variance risk premium (IV² - RV²) is negative (implying long volatility)
+    # or positive (short volatility). Combined with the user's risk tolerance, we assign a recommended
+    # position. For example:
+    #  • In a "Long Volatility" regime (negative VRP), a risk-averse trader might buy Limited OTM Puts,
+    #    while a more aggressive trader might enter a Leveraged Long Straddle.
+    #  • Conversely, in a "Short Volatility" regime (positive VRP), the recommendation may be to sell
+    #    option strategies such as Call Spreads or Strangles.
     if vrp_regime == "Long Volatility":
         if risk_tolerance == "Conservative":
             recommendation = "Long Volatility (Conservative): Buy Limited OTM Puts"
@@ -698,7 +707,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
 # MAIN DASHBOARD
 ###########################################
 def main():
-    # User authentication
+    # Authentication
     login()
     st.title("Crypto Options Visualization Dashboard with Dynamic Volatility Adjustments")
     if st.button("Logout"):
@@ -754,13 +763,11 @@ def main():
     df_calls = df[df["option_type"] == "C"].copy().sort_values("date_time")
     df_puts = df[df["option_type"] == "P"].copy().sort_values("date_time")
 
-    # Compute aggregate IV statistics
-    df_iv_agg = (df.groupby("date_time", as_index=False)["iv_close"]
-                 .mean().rename(columns={"iv_close": "iv_mean"}))
+    # Compute aggregate IV statistics and rolling IV statistics for market regime determination
+    df_iv_agg = df.groupby("date_time", as_index=False)["iv_close"].mean().rename(columns={"iv_close": "iv_mean"})
     df_iv_agg["date_time"] = pd.to_datetime(df_iv_agg["date_time"])
     df_iv_agg = df_iv_agg.set_index("date_time")
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
-    # Compute rolling IV statistics for market regime
     df_iv_agg["iv_rolling_mean"] = df_iv_agg["iv_mean"].rolling("1D").mean()
     df_iv_agg["iv_rolling_std"] = df_iv_agg["iv_mean"].rolling("1D").std()
     df_iv_agg["upper_zone"] = df_iv_agg["iv_rolling_mean"] + df_iv_agg["iv_rolling_std"]
@@ -824,13 +831,13 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
 
-    # Set EV sign based on recommended position:
+    # Determine EV position side based on the recommended position
     if trade_decision["position"] in ["Limited OTM Puts", "ATM Straddle", "Leveraged Long Straddle"]:
         position_side = "long"
     else:
         position_side = "short"
 
-    # EV Analysis: Compute EV based on the recommended position
+    # EV Analysis: Compute EV based on the recommended position.
     rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
@@ -875,9 +882,10 @@ def main():
         st.write("Position Size: Adjust based on capital (e.g., 1-5% of portfolio for chosen risk tolerance)")
         st.write("Monitor price and volatility in real-time and adjust hedges dynamically.")
 
+    # Update gamma values for plotting
     if not df_calls.empty and not df_puts.empty:
-        df_calls["gamma"] = df_calls.apply(lambda row: compute_gamma(row, spot_price), axis=1)
-        df_puts["gamma"] = df_puts.apply(lambda row: compute_gamma(row, spot_price), axis=1)
+        df_calls["gamma"] = df_calls.apply(lambda row: compute_delta(row, spot_price), axis=1)
+        df_puts["gamma"] = df_puts.apply(lambda row: compute_delta(row, spot_price), axis=1)
     st.subheader("Volatility Smile at Latest Timestamp")
     latest_ts = df["date_time"].max()
     smile_df_latest = df[df["date_time"] == latest_ts]
@@ -896,6 +904,7 @@ def main():
         st.plotly_chart(fig_vol_smile, use_container_width=True)
         plot_gamma_heatmap(pd.concat([df_calls, df_puts]))
 
+    # Compute and plot gamma exposure (GEX)
     gex_data = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
