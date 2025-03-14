@@ -26,9 +26,10 @@ URL_TICKER = f"{BASE_URL}/{TICKER_ENDPOINT}"
 windows = {"7D": "vrp_7d"}
 DEFAULT_EXPIRY_STR = "28MAR25"
 
-# Calculate time to expiry using default expiry
-expiry_date = dt.datetime.strptime(DEFAULT_EXPIRY_STR, "%d%b%y")
-current_date = dt.datetime.now(dt.timezone.utc)  # use UTC for consistency
+# Calculate time to expiry using default expiry.
+# Convert expiry_date to timezone aware (UTC) for consistency.
+expiry_date = dt.datetime.strptime(DEFAULT_EXPIRY_STR, "%d%b%y").replace(tzinfo=dt.timezone.utc)
+current_date = dt.datetime.now(dt.timezone.utc)
 days_to_expiry = (expiry_date - current_date).days
 T_YEARS = days_to_expiry / 365
 
@@ -201,7 +202,8 @@ def fetch_data(instruments_tuple):
         .assign(date_time=lambda df: pd.to_datetime(df["ts"], unit="s")
                 .dt.tz_localize("UTC")
                 .dt.tz_convert("America/New_York"))
-        .assign(k=lambda df: df["instrument_name"].map(lambda s: int(s.split("-")[2]) if len(s.split("-")) >= 3 and s.split("-")[2].isdigit() else np.nan))
+        .assign(k=lambda df: df["instrument_name"].map(lambda s: int(s.split("-")[2])
+                                                       if len(s.split("-")) >= 3 and s.split("-")[2].isdigit() else np.nan))
         .assign(option_type=lambda df: df["instrument_name"].str.split("-").str[-1])
     )
     return df
@@ -364,7 +366,7 @@ def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    # Standard GEX: Gamma * Spot² * OpenInterest
+    # Standard GEX = Gamma * Spot^2 * OpenInterest
     return gamma * oi * (S ** 2)
 
 ###########################################
@@ -388,7 +390,8 @@ def plot_gex_by_strike(df_gex):
 
 def plot_net_gex(df_gex, spot_price):
     st.subheader("Net Gamma Exposure by Strike")
-    df_gex_net = df_gex.groupby("strike").apply(lambda x: x.loc[x["option_type"] == "C", "gex"].sum() - x.loc[x["option_type"] == "P", "gex"].sum()).reset_index(name="net_gex")
+    df_gex_net = df_gex.groupby("strike").apply(lambda x: x.loc[x["option_type"] == "C", "gex"].sum() - 
+                                                x.loc[x["option_type"] == "P", "gex"].sum()).reset_index(name="net_gex")
     df_gex_net["sign"] = df_gex_net["net_gex"].apply(lambda val: "Negative" if val < 0 else "Positive")
     fig_net_gex = px.bar(df_gex_net, x="strike", y="net_gex", color="sign",
                          color_discrete_map={"Negative": "orange", "Positive": "blue"},
@@ -442,7 +445,7 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv):
     ev_candidates = []
     for strike, data in atm_strikes.items():
         avg_iv = data["iv_sum"] / data["count"]
-        # EV using variance difference: ((IV² - RV²)*T)/2, result shown as a fraction (convert later to percentage if needed)
+        # EV using variance difference: ((IV^2 - RV^2) * T) / 2
         ev_value = ((avg_iv**2 - rv**2) * T) / 2
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
@@ -546,7 +549,7 @@ def adjust_volatility_with_smile(strike, smile_df):
     sorted_smile = smile_df.sort_values("strike")
     strikes = sorted_smile["strike"].values
     ivs = sorted_smile["iv"].values
-    # Use linear interpolation to adjust IV
+    # Use linear interpolation by default.
     adjusted_iv = np.interp(strike, strikes, ivs)
     return adjusted_iv
 
@@ -603,6 +606,7 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
         raw_iv = ticker_data.get("iv", None)
         if raw_iv is None:
             continue
+        # Adjust IV using the observed volatility smile
         adjusted_iv = adjust_volatility_with_smile(strike, smile_df)
         try:
             d1 = (np.log(spot / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
@@ -767,7 +771,7 @@ def main():
     df_iv_agg["market_regime"] = np.where(df_iv_agg["iv_mean"] > df_iv_agg["rolling_mean"], "Risk-Off", "Risk-On")
     df_iv_agg_reset = df_iv_agg.reset_index()
 
-    # Build preliminary ticker list using raw IV
+    # Build preliminary ticker list using raw IV values
     preliminary_ticker_list = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
@@ -820,7 +824,7 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
     
-    # EV Analysis: choose EV function based on recommended position.
+    # EV Analysis: choose the appropriate EV function based on recommended position.
     rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
@@ -852,7 +856,7 @@ def main():
         if not df_ev_clean.empty:
             best_candidate = df_ev_clean.loc[df_ev_clean["EV"].idxmax()]
             best_strike = best_candidate["Strike"]
-            # Optionally, convert EV from fraction to percentage: multiply by 100
+            # Convert EV from fraction to percentage
             df_ev_clean["EV (%)"] = df_ev_clean["EV"] * 100
             st.write("Candidate Strikes and their Expected Value (EV) in %:")
             st.dataframe(df_ev_clean)
