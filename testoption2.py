@@ -121,7 +121,7 @@ def login():
             creds = load_credentials()
             if username in creds and creds[username] == password:
                 st.session_state.logged_in = True
-                st.success("Logged in successfully!")
+                st.success("Logged in successfully! Click ont the login a second time to open the app! Enjoy")
             else:
                 st.error("Invalid username or password")
         st.stop()
