@@ -904,11 +904,12 @@ def main():
     risk_tolerance = st.sidebar.selectbox("Risk Tolerance",
                                           options=["Conservative", "Moderate", "Aggressive"],
                                           index=1)
+# With this:
     trade_decision = evaluate_trade_strategy(
         df, spot_price, risk_tolerance, df_iv_agg_reset,
         historical_vols=daily_rv,
         historical_vrps=historical_vrps,
-        days_to_expiration=days_to_expiry
+        expiry_date=expiry_date  # Pass expiry_date instead of days_to_expiration
     )
 
     st.write("### Market and Volatility Metrics")
