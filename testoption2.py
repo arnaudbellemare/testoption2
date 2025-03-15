@@ -15,10 +15,6 @@ from scipy.interpolate import CubicSpline
 # Global settings
 ###########################################
 
-
-###########################################
-# Thalex API details
-###########################################
 BASE_URL = "https://thalex.com/api/v2/public"
 instruments_endpoint = "instruments"  # Endpoint for fetching available instruments
 url_instruments = f"{BASE_URL}/{instruments_endpoint}"
@@ -59,6 +55,23 @@ COLUMNS = [
     "iv_low",
     "iv_close",
 ]
+
+###########################################
+# Risk Adjustment Function
+###########################################
+def compute_risk_adjustment_factor(df):
+    """
+    Computes a risk adjustment factor based on the excess kurtosis
+    of historical returns from Kraken data.
+    This factor is used to adjust volatility measures in crypto markets.
+    """
+    df = df.copy()
+    if "close" not in df.columns:
+        return 1.0
+    df['return'] = df['close'].pct_change()
+    kurt = df['return'].kurtosis()  # Excess kurtosis (for a normal dist., this is ~0)
+    risk_factor = 1 + max(0, kurt / 10)  # Simple scaling: if kurtosis is high, risk_factor > 1
+    return risk_factor
 
 ###########################################
 # EXPIRATION DATE HELPER FUNCTIONS
@@ -121,7 +134,7 @@ def login():
             creds = load_credentials()
             if username in creds and creds[username] == password:
                 st.session_state.logged_in = True
-                st.success("Logged in successfully! Click ont the login a second time to open the app! Enjoy")
+                st.success("Logged in successfully! Click the login button a second time to open the app!")
             else:
                 st.error("Invalid username or password")
         st.stop()
@@ -244,11 +257,12 @@ def fetch_kraken_data():
     return full_df[~full_df.index.duplicated()]
 
 ###########################################
-# PARKINSON VOLATILITY CALCULATION
+# PARKINSON VOLATILITY CALCULATION (Adjusted)
 ###########################################
 def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365):
     """
-    Calculate Parkinson volatility using daily high/low prices.
+    Calculate Parkinson volatility using daily high/low prices,
+    adjusted for crypto market idiosyncrasies via a risk adjustment multiplier.
     """
     if price_data.empty or not {'high', 'low'}.issubset(price_data.columns):
         return np.nan
@@ -262,6 +276,9 @@ def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365
     parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1).apply(
         lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
     annualized_vol = np.sqrt(parkinson_var * annualize_days)
+    # Adjust with risk factor (global variable risk_factor)
+    if 'risk_factor' in globals():
+        annualized_vol = annualized_vol * risk_factor
     if "date_time" in price_data.columns:
         return annualized_vol.reindex(price_data.index, method='ffill')
     else:
@@ -290,7 +307,7 @@ def compute_historical_vrp(daily_iv, daily_rv):
     return [(iv ** 2) - (rv ** 2) for iv, rv in zip(daily_iv[:n], daily_rv[:n])]
 
 ###########################################
-# OPTION DELTA CALCULATION FUNCTION
+# Option Delta and Gamma Calculation (Adjusted)
 ###########################################
 def compute_delta(row, S):
     try:
@@ -306,43 +323,13 @@ def compute_delta(row, S):
     sigma = row["iv_close"]
     if sigma <= 0:
         return np.nan
+    # Adjust sigma with global risk_factor to account for crypto idiosyncrasies
+    sigma_eff = sigma * risk_factor if 'risk_factor' in globals() else sigma
     try:
-        d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + 0.5 * sigma_eff**2 * T) / (sigma_eff * np.sqrt(T))
     except Exception:
         return np.nan
     return norm.cdf(d1) if row["option_type"] == "C" else norm.cdf(d1) - 1
-
-###########################################
-# DELTA-BASED DYNAMIC REGIME FUNCTIONS
-###########################################
-def compute_average_delta(df_calls, df_puts, S):
-    if "delta" not in df_calls.columns:
-        df_calls["delta"] = df_calls.apply(lambda row: compute_delta(row, S), axis=1)
-    if "delta" not in df_puts.columns:
-        df_puts["delta"] = df_puts.apply(lambda row: compute_delta(row, S), axis=1)
-    df_calls_mean = df_calls.groupby("date_time", as_index=False)["delta"].mean().rename(columns={"delta": "call_delta_avg"})
-    df_puts_mean = df_puts.groupby("date_time", as_index=False)["delta"].mean().rename(columns={"delta": "put_delta_avg"})
-    df_merged = pd.merge(df_calls_mean, df_puts_mean, on="date_time", how="outer").sort_values("date_time")
-    df_merged["delta_diff"] = df_merged["call_delta_avg"] - df_merged["put_delta_avg"]
-    return df_merged
-
-def rolling_percentile_zones(df, column="delta_diff", window="1D", lower_percentile=33, upper_percentile=66):
-    df = df.set_index("date_time").sort_index()
-    def percentile_in_window(x, q):
-        return np.percentile(x, q)
-    df["rolling_lower_zone"] = df[column].rolling(window, min_periods=1).apply(lambda x: percentile_in_window(x, lower_percentile), raw=False)
-    df["rolling_upper_zone"] = df[column].rolling(window, min_periods=1).apply(lambda x: percentile_in_window(x, upper_percentile), raw=False)
-    return df.reset_index()
-
-def classify_regime(row):
-    if pd.isna(row["rolling_lower_zone"]) or pd.isna(row["rolling_upper_zone"]):
-        return "Neutral"
-    if row["delta_diff"] > row["rolling_upper_zone"]:
-        return "Risk-On"
-    elif row["delta_diff"] < row["rolling_lower_zone"]:
-        return "Risk-Off"
-    else:
-        return "Neutral"
 
 def compute_gamma(row, S):
     try:
@@ -358,105 +345,27 @@ def compute_gamma(row, S):
     sigma = row["iv_close"]
     if sigma <= 0:
         return np.nan
+    sigma_eff = sigma * risk_factor if 'risk_factor' in globals() else sigma
     try:
-        d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + 0.5 * sigma_eff**2 * T) / (sigma_eff * np.sqrt(T))
     except Exception:
         return np.nan
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    gamma = norm.pdf(d1) / (S * sigma_eff * np.sqrt(T))
     return gamma
 
 def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    # Standard GEX = Gamma * Spot^2 * OpenInterest 
-    return gamma * oi * (S ** 2) 
+    # Standard GEX = Gamma * Spot^2 * Open Interest 
+    return gamma * oi * (S ** 2)
 
 ###########################################
-# GAMMA & GEX VISUALIZATIONS
+# EV Calculation Functions (Adjusted for Risk)
 ###########################################
-def plot_gamma_heatmap(df):
-    st.subheader("Gamma Heatmap by Strike and Time")
-    fig_gamma_heatmap = px.density_heatmap(
-        df,
-        x="date_time",
-        y="k",
-        z="gamma",
-        color_continuous_scale="Viridis",
-        title="Gamma by Strike Over Time"
-    )
-    fig_gamma_heatmap.update_layout(height=400, width=800)
-    st.plotly_chart(fig_gamma_heatmap, use_container_width=True)
-
-def plot_gex_by_strike(df_gex):
-    st.subheader("Gamma Exposure (GEX) by Strike")
-    fig_gex = px.bar(
-        df_gex,
-        x="strike",
-        y="gex",
-        color="option_type",
-        title="Gamma Exposure (GEX) by Strike",
-        labels={"gex": "GEX", "strike": "Strike Price"}
-    )
-    fig_gex.update_layout(height=400, width=800)
-    st.plotly_chart(fig_gex, use_container_width=True)
-
-def plot_net_gex(df_gex, spot_price):
-    st.subheader("Net Gamma Exposure by Strike")
-    df_gex_net = df_gex.groupby("strike").apply(
-        lambda x: x.loc[x["option_type"] == "C", "gex"].sum() - x.loc[x["option_type"] == "P", "gex"].sum()
-    ).reset_index(name="net_gex")
-    df_gex_net["sign"] = df_gex_net["net_gex"].apply(lambda val: "Negative" if val < 0 else "Positive")
-    fig_net_gex = px.bar(
-        df_gex_net,
-        x="strike",
-        y="net_gex",
-        color="sign",
-        color_discrete_map={"Negative": "orange", "Positive": "blue"},
-        title="Net Gamma Exposure (Calls GEX - Puts GEX)",
-        labels={"net_gex": "Net GEX", "strike": "Strike Price"}
-    )
-    fig_net_gex.add_hline(y=0, line_dash="dash", line_color="red")
-    fig_net_gex.add_vline(
-        x=spot_price,
-        line_dash="dash",
-        line_color="lightgrey",
-        annotation_text=f"Spot {spot_price:.0f}",
-        annotation_position="top right"
-    )
-    fig_net_gex.update_layout(height=400, width=800)
-    st.plotly_chart(fig_net_gex, use_container_width=True)
-
-###########################################
-# PERCENTILE-BASED RISK CLASSIFICATIONS
-###########################################
-def classify_volatility_regime(current_vol, historical_vols):
-    percentile = percentileofscore(historical_vols, current_vol)
-    if percentile < 5:
-        return "Low Volatility"
-    elif percentile > 95:
-        return "High Volatility"
-    else:
-        return "Medium Volatility"
-
-def classify_vrp_regime(current_vrp, historical_vrps):
-    percentile = percentileofscore(historical_vrps, current_vrp)
-    if current_vrp < 0:
-        return "Long Volatility"
-    elif percentile > 75:
-        return "Short Volatility"
-    elif percentile < 25:
-        return "Long Volatility"
-    else:
-        return "Neutral"
-
-###########################################
-# EV CALCULATION FUNCTIONS FOR DIFFERENT STRATEGIES
-###########################################
-# Helper function to adjust EV based on position side
 def adjust_ev(ev_value, position_side):
     """
-    Adjust the EV value based on the position side.
+    Adjust the EV value based on position side.
     For "long" volatility positions (buying options), flip the sign so that a positive
     number represents a favorable expected profit from the buyer's perspective.
     For "short" volatility positions, the value is unchanged.
@@ -467,7 +376,6 @@ def adjust_ev(ev_value, position_side):
         return ev_value
 
 def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For ATM Straddle EV analysis using variance difference (expressed as a percentage)
     tolerance = spot_price * 0.02  
     atm_candidates = [item for item in ticker_list if abs(item["strike"] - spot_price) <= tolerance]
     if not atm_candidates:
@@ -483,15 +391,15 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side="sho
     ev_candidates = []
     for strike, data in atm_strikes.items():
         avg_iv = data["iv_sum"] / data["count"]
-        # EV using variance difference formula
         ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
+        # Adjust EV by dividing by risk_factor to penalize higher risk environments
+        ev_value = ev_value / risk_factor if 'risk_factor' in globals() else ev_value
         ev_value = adjust_ev(ev_value, position_side)
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_limited_otm_put_ev(ticker_list, spot_price, T, rv, position_side="long"):
-    # For Limited OTM Puts: consider put options with strike below spot.
     tolerance = spot_price * 0.10  
     candidates = [item for item in ticker_list if item["option_type"] == "P" and item["strike"] < spot_price and (spot_price - item["strike"]) <= tolerance]
     if not candidates:
@@ -508,13 +416,13 @@ def calculate_limited_otm_put_ev(ticker_list, spot_price, T, rv, position_side="
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
         ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
+        ev_value = ev_value / risk_factor if 'risk_factor' in globals() else ev_value
         ev_value = adjust_ev(ev_value, position_side)
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_call_spread_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For Call Spreads: consider call options with strike above spot.
     tolerance = spot_price * 0.10  
     candidates = [item for item in ticker_list if item["option_type"] == "C" and item["strike"] > spot_price and (item["strike"] - spot_price) <= tolerance]
     if not candidates:
@@ -531,13 +439,13 @@ def calculate_call_spread_ev(ticker_list, spot_price, T, rv, position_side="shor
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
         ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
+        ev_value = ev_value / risk_factor if 'risk_factor' in globals() else ev_value
         ev_value = adjust_ev(ev_value, position_side)
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_strangle_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For Strangles: include OTM calls and puts.
     tolerance = spot_price * 0.10  
     candidates = [item for item in ticker_list if ((item["option_type"] == "C" and item["strike"] > spot_price and (item["strike"] - spot_price) <= tolerance)
                                                      or (item["option_type"] == "P" and item["strike"] < spot_price and (spot_price - item["strike"]) <= tolerance))]
@@ -555,13 +463,13 @@ def calculate_strangle_ev(ticker_list, spot_price, T, rv, position_side="short")
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
         ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
+        ev_value = ev_value / risk_factor if 'risk_factor' in globals() else ev_value
         ev_value = adjust_ev(ev_value, position_side)
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
     return df_ev.sort_values("EV (%)", ascending=False)
 
 def calculate_naked_call_ev(ticker_list, spot_price, T, rv, position_side="short"):
-    # For Naked Calls: consider all call options with strike above spot.
     candidates = [item for item in ticker_list if item["option_type"] == "C" and item["strike"] > spot_price]
     if not candidates:
         return None
@@ -577,6 +485,7 @@ def calculate_naked_call_ev(ticker_list, spot_price, T, rv, position_side="short
     for strike, data in group.items():
         avg_iv = data["iv_sum"] / data["count"]
         ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
+        ev_value = ev_value / risk_factor if 'risk_factor' in globals() else ev_value
         ev_value = adjust_ev(ev_value, position_side)
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
     df_ev = pd.DataFrame(ev_candidates)
@@ -591,7 +500,6 @@ def calculate_small_atm_straddle_ev(ticker_list, spot_price, T, rv, position_sid
 def adjust_volatility_with_smile(strike, smile_df):
     """
     Adjust the implied volatility for a given strike based on the observed volatility smile.
-    The smile_df DataFrame must contain 'strike' and 'iv' columns.
     """
     sorted_smile = smile_df.sort_values("strike")
     strikes = sorted_smile["strike"].values
@@ -669,46 +577,19 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
 ###########################################
 # UPDATED TRADE STRATEGY EVALUATION
 ###########################################
-###########################################
-# UPDATED TRADE STRATEGY EVALUATION
-###########################################
 def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg_reset=None,
                            historical_vols=None, historical_vrps=None, expiry_date=None):
-    """
-    Evaluates the optimal trading strategy based on volatility metrics, market regime, and risk tolerance.
-    
-    Args:
-        df (pd.DataFrame): DataFrame containing option data (IV, strikes, etc.).
-        spot_price (float): Current spot price of the underlying asset.
-        risk_tolerance (str): Risk tolerance level ("Conservative", "Moderate", "Aggressive").
-        df_iv_agg_reset (pd.DataFrame): DataFrame with aggregated IV data.
-        historical_vols (list): Historical realized volatility values.
-        historical_vrps (list): Historical VRP values.
-        expiry_date (datetime): Expiration date of the option.
-    
-    Returns:
-        dict: A dictionary containing trading recommendations, volatility metrics, and market regime.
-    """
-    # Calculate days to expiration dynamically
     current_date = dt.datetime.now()
-    days_to_expiration = (expiry_date - current_date).days if expiry_date else 7  # Default to 7 if expiry_date is None
-
-    # Calculate RV using a window matching the option's time to expiration
+    days_to_expiration = (expiry_date - current_date).days if expiry_date else 7
     rv_vol_series = calculate_parkinson_volatility(df_kraken, window_days=days_to_expiration)
     rv_vol = rv_vol_series.iloc[-1] if not rv_vol_series.empty else np.nan
     iv_vol = df["iv_close"].mean() if not df.empty else np.nan
-
-    # Compute variance and VRP
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
     iv_var = iv_vol ** 2 if not pd.isna(iv_vol) else np.nan
     current_vrp = iv_var - rv_var if (not pd.isna(iv_vol) and not pd.isna(rv_vol)) else np.nan
-
-    # Check for IV-RV divergence
     divergence = abs(iv_vol - rv_vol) / rv_vol if (rv_vol != 0 and not pd.isna(iv_vol)) else np.nan
     if not np.isnan(divergence) and divergence > 0.20:
         st.write(f"Alert: IV and RV diverge by {divergence * 100:.2f}% (threshold: 20%).")
-
-    # Compute rolling 1-day IV statistics for market regime determination
     df_iv_agg = df.groupby("date_time")["iv_close"].mean().to_frame(name="iv_mean")
     df_iv_agg.index = pd.to_datetime(df_iv_agg.index)
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
@@ -719,8 +600,6 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     latest_iv = df_iv_agg["iv_mean"].iloc[-1]
     latest_upper = df_iv_agg["upper_zone"].iloc[-1]
     latest_lower = df_iv_agg["lower_zone"].iloc[-1]
-
-    # Determine market regime based on IV
     if latest_iv > latest_upper:
         market_regime = "Risk-Off"
     elif latest_iv < latest_lower:
@@ -728,25 +607,17 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     else:
         market_regime = "Neutral"
     vol_regime = market_regime
-
-    # Classify VRP regime
     vrp_regime = classify_vrp_regime(current_vrp, historical_vrps) if historical_vrps and len(historical_vrps) > 0 else "Neutral"
-
-    # Calculate average delta and gamma for calls and puts
     call_items = [item for item in ticker_list if item["option_type"] == "C"]
     put_items = [item for item in ticker_list if item["option_type"] == "P"]
     call_oi_total = sum(item["open_interest"] for item in call_items)
     put_oi_total = sum(item["open_interest"] for item in put_items)
     avg_call_delta = (sum(item["delta"] * item["open_interest"] for item in call_items) / call_oi_total) if call_oi_total > 0 else 0
     avg_put_delta = (sum(item["delta"] * item["open_interest"] for item in put_items) / put_oi_total) if put_oi_total > 0 else 0
-
-    # Compute put/call open interest ratio
     df_ticker = pd.DataFrame(ticker_list) if ticker_list else pd.DataFrame()
     call_oi = df_ticker[df_ticker["option_type"] == "C"]["open_interest"].sum() if not df_ticker.empty else 0
     put_oi = df_ticker[df_ticker["option_type"] == "P"]["open_interest"].sum() if not df_ticker.empty else 0
     put_call_ratio = put_oi / call_oi if call_oi > 0 else np.inf
-
-    # Calculate gamma for calls and puts
     df_calls = df[df["option_type"] == "C"].copy()
     df_puts = df[df["option_type"] == "P"].copy()
     if "gamma" not in df_calls.columns:
@@ -755,8 +626,6 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
         df_puts["gamma"] = df_puts.apply(lambda row: compute_gamma(row, spot_price), axis=1)
     avg_call_gamma = df_calls["gamma"].mean() if not df_calls.empty else 0
     avg_put_gamma = df_puts["gamma"].mean() if not df_puts.empty else 0
-
-    # Determine trading recommendation based on VRP regime and risk tolerance
     if vrp_regime == "Long Volatility":
         if risk_tolerance == "Conservative":
             recommendation = "Long Volatility (Conservative): Buy limited OTM Puts"
@@ -787,7 +656,6 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
         recommendation = "Gamma Scalping (Neutral): Consider buying small ATM straddles"
         position = "Small ATM Straddle"
         hedge_action = "Implement light delta hedging"
-
     return {
         "recommendation": recommendation,
         "position": position,
@@ -803,12 +671,87 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
         "avg_put_gamma": avg_put_gamma
     }
 
+def classify_vrp_regime(current_vrp, historical_vrps):
+    percentile = percentileofscore(historical_vrps, current_vrp)
+    if current_vrp < 0:
+        return "Long Volatility"
+    elif percentile > 75:
+        return "Short Volatility"
+    elif percentile < 25:
+        return "Long Volatility"
+    else:
+        return "Neutral"
+
+###########################################
+# VISUALIZATION FUNCTIONS
+###########################################
+def plot_gamma_heatmap(df):
+    st.subheader("Gamma Heatmap by Strike and Time")
+    fig_gamma_heatmap = px.density_heatmap(
+        df,
+        x="date_time",
+        y="k",
+        z="gamma",
+        color_continuous_scale="Viridis",
+        title="Gamma by Strike Over Time"
+    )
+    fig_gamma_heatmap.update_layout(height=400, width=800)
+    st.plotly_chart(fig_gamma_heatmap, use_container_width=True)
+
+def plot_gex_by_strike(df_gex):
+    st.subheader("Gamma Exposure (GEX) by Strike")
+    fig_gex = px.bar(
+        df_gex,
+        x="strike",
+        y="gex",
+        color="option_type",
+        title="Gamma Exposure (GEX) by Strike",
+        labels={"gex": "GEX", "strike": "Strike Price"}
+    )
+    fig_gex.update_layout(height=400, width=800)
+    st.plotly_chart(fig_gex, use_container_width=True)
+
+def plot_net_gex(df_gex, spot_price):
+    st.subheader("Net Gamma Exposure by Strike")
+    df_gex_net = df_gex.groupby("strike").apply(
+        lambda x: x.loc[x["option_type"] == "C", "gex"].sum() - x.loc[x["option_type"] == "P", "gex"].sum()
+    ).reset_index(name="net_gex")
+    df_gex_net["sign"] = df_gex_net["net_gex"].apply(lambda val: "Negative" if val < 0 else "Positive")
+    fig_net_gex = px.bar(
+        df_gex_net,
+        x="strike",
+        y="net_gex",
+        color="sign",
+        color_discrete_map={"Negative": "orange", "Positive": "blue"},
+        title="Net Gamma Exposure (Calls GEX - Puts GEX)",
+        labels={"net_gex": "Net GEX", "strike": "Strike Price"}
+    )
+    fig_net_gex.add_hline(y=0, line_dash="dash", line_color="red")
+    fig_net_gex.add_vline(
+        x=spot_price,
+        line_dash="dash",
+        line_color="lightgrey",
+        annotation_text=f"Spot {spot_price:.0f}",
+        annotation_position="top right"
+    )
+    fig_net_gex.update_layout(height=400, width=800)
+    st.plotly_chart(fig_net_gex, use_container_width=True)
+
+def classify_volatility_regime(current_vol, historical_vols):
+    percentile = percentileofscore(historical_vols, current_vol)
+    if percentile < 5:
+        return "Low Volatility"
+    elif percentile > 95:
+        return "High Volatility"
+    else:
+        return "Medium Volatility"
+
 ###########################################
 # MAIN DASHBOARD
 ###########################################
 def main():
     login()
-    st.title("Crypto Options Visualization Dashboard (Plotly Version) with Dynamic Volatility Adjustments")
+    st.title("Crypto Options Visualization Dashboard with Enhanced Risk Adjustments")
     if st.button("Logout"):
         st.session_state.logged_in = False
         st.stop()
@@ -840,6 +783,11 @@ def main():
     spot_price = df_kraken["close"].iloc[-1]
     st.write(f"Current BTC/USD Price: {spot_price:.2f}")
 
+    # Compute risk adjustment factor from historical data
+    global risk_factor
+    risk_factor = compute_risk_adjustment_factor(df_kraken)
+    st.write(f"Risk Adjustment Factor: {risk_factor:.2f}")
+
     try:
         filtered_calls, filtered_puts = get_filtered_instruments(spot_price, expiry_str, T_YEARS, multiplier)
     except Exception as e:
@@ -862,14 +810,12 @@ def main():
     df_iv_agg["date_time"] = pd.to_datetime(df_iv_agg["date_time"])
     df_iv_agg = df_iv_agg.set_index("date_time")
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
-    # Compute rolling IV statistics for market regime
     df_iv_agg["iv_rolling_mean"] = df_iv_agg["iv_mean"].rolling("1D").mean()
     df_iv_agg["iv_rolling_std"] = df_iv_agg["iv_mean"].rolling("1D").std()
     df_iv_agg["upper_zone"] = df_iv_agg["iv_rolling_mean"] + df_iv_agg["iv_rolling_std"]
     df_iv_agg["lower_zone"] = df_iv_agg["iv_rolling_mean"] - df_iv_agg["iv_rolling_std"]
     df_iv_agg_reset = df_iv_agg.reset_index()
 
-    # Build preliminary ticker list with raw IV values
     preliminary_ticker_list = []
     for instrument in all_instruments:
         ticker_data = fetch_ticker(instrument)
@@ -891,8 +837,6 @@ def main():
             "iv": raw_iv
         })
     smile_df = build_smile_df(preliminary_ticker_list)
-
-    # Rebuild ticker list using dynamic volatility adjustment based on the observed smile
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
 
@@ -904,12 +848,12 @@ def main():
     risk_tolerance = st.sidebar.selectbox("Risk Tolerance",
                                           options=["Conservative", "Moderate", "Aggressive"],
                                           index=1)
-# With this:
+
     trade_decision = evaluate_trade_strategy(
         df, spot_price, risk_tolerance, df_iv_agg_reset,
         historical_vols=daily_rv,
         historical_vrps=historical_vrps,
-        expiry_date=expiry_date  # Pass expiry_date instead of days_to_expiration
+        expiry_date=expiry_date
     )
 
     st.write("### Market and Volatility Metrics")
@@ -927,12 +871,9 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
 
-    # EV Analysis: Use the appropriate EV function based on recommended position.
     rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
-    # Here we decide the EV calculation based on the recommended position.
-    # For long volatility positions (buying options), we flip the sign so that a positive EV (%) indicates expected profit.
     if position in ["ATM Straddle", "Leveraged Long Straddle"]:
         df_ev = calculate_atm_straddle_ev(ticker_list, spot_price, T_YEARS, rv_scalar, position_side="long")
         st.subheader("ATM Straddle EV Analysis")
