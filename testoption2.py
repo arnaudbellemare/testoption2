@@ -257,54 +257,47 @@ def fetch_kraken_data():
     return full_df[~full_df.index.duplicated()]
 
 ###########################################
-# PARKINSON VOLATILITY CALCULATION (Adjusted)
+# EWMA-ROGER SATCHELL VOLATILITY CALCULATION
 ###########################################
-def calculate_parkinson_volatility(price_data, window_days=7, annualize_days=365):
+def calculate_ewma_roger_satchell_volatility(price_data, span=30):
     """
-    Calculate Parkinson volatility using daily high/low prices,
-    adjusted for crypto market idiosyncrasies via a risk adjustment multiplier.
+    Calculate realized volatility using the Roger-Satchell estimator with an EWMA.
+    Assumes price_data has columns: 'open', 'high', 'low', 'close'.
     """
-    if price_data.empty or not {'high', 'low'}.issubset(price_data.columns):
-        return np.nan
-    if "date_time" in price_data.columns:
-        daily_data = price_data.resample('D', on='date_time').agg({'high': 'max', 'low': 'min'}).dropna()
-    else:
-        daily_data = price_data.resample('D').agg({'high': 'max', 'low': 'min'}).dropna()
-    if len(daily_data) < window_days:
-        return np.nan
-    daily_data['log_hl_ratio'] = np.log(daily_data['high'] / daily_data['low'])
-    parkinson_var = daily_data['log_hl_ratio'].rolling(window=window_days, min_periods=1).apply(
-        lambda x: np.sum(x**2) / (4 * np.log(2) * window_days), raw=True)
-    annualized_vol = np.sqrt(parkinson_var * annualize_days)
-    # Adjust with risk factor (global variable risk_factor)
-    if 'risk_factor' in globals():
-        annualized_vol = annualized_vol * risk_factor
-    if "date_time" in price_data.columns:
-        return annualized_vol.reindex(price_data.index, method='ffill')
-    else:
-        return annualized_vol.reindex(price_data.index, method='ffill')
+    df = price_data.copy()
+    # Compute the Roger-Satchell estimator for each day
+    df['rs'] = (np.log(df['high'] / df['close']) * np.log(df['high'] / df['open']) +
+                np.log(df['low'] / df['close']) * np.log(df['low'] / df['open']))
+    # Apply EWMA on the RS series
+    ewma_rs = df['rs'].ewm(span=span, adjust=False).mean()
+    # Ensure non-negative values and compute volatility as the square root
+    volatility = np.sqrt(ewma_rs.clip(lower=0))
+    return volatility
 
-def compute_daily_realized_volatility(df, window_days=7):
+def compute_daily_realized_volatility(df, span=30, annualize_days=365):
+    """
+    Resample the data daily using OHLC (open, high, low, close), then compute the
+    realized volatility using the EWMA of the Roger-Satchell estimator. The result is annualized.
+    """
     if 'date_time' in df.columns:
-        df_daily = df.resample('D', on='date_time').agg({'high': 'max', 'low': 'min'}).dropna()
+        df_daily = df.resample('D', on='date_time').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last'
+        }).dropna()
     else:
-        df_daily = df.resample('D').agg({'high': 'max', 'low': 'min'}).dropna()
-    daily_vols = []
-    for i in range(window_days, len(df_daily) + 1):
-        window = df_daily.iloc[max(0, i - window_days):i]
-        if len(window) < window_days:
-            continue
-        vol = calculate_parkinson_volatility(window, window_days=window_days)
-        daily_vols.append(vol.iloc[-1] if not vol.empty else np.nan)
-    return [v for v in daily_vols if not np.isnan(v)]
-    
-def compute_daily_average_iv(df_iv_agg):
-    daily_iv = df_iv_agg["iv_mean"].resample("D").mean(numeric_only=True).dropna().tolist()
-    return daily_iv
-
-def compute_historical_vrp(daily_iv, daily_rv):
-    n = min(len(daily_iv), len(daily_rv))
-    return [(iv ** 2) - (rv ** 2) for iv, rv in zip(daily_iv[:n], daily_rv[:n])]
+        df_daily = df.resample('D').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last'
+        }).dropna()
+    # Calculate daily volatility using EWMA Roger-Satchell
+    daily_vol = calculate_ewma_roger_satchell_volatility(df_daily, span=span)
+    # Annualize the volatility
+    daily_vol_annualized = daily_vol * np.sqrt(annualize_days)
+    return daily_vol_annualized
 
 ###########################################
 # Option Delta and Gamma Calculation (Adjusted)
@@ -323,7 +316,6 @@ def compute_delta(row, S):
     sigma = row["iv_close"]
     if sigma <= 0:
         return np.nan
-    # Adjust sigma with global risk_factor to account for crypto idiosyncrasies
     sigma_eff = sigma * risk_factor if 'risk_factor' in globals() else sigma
     try:
         d1 = (np.log(S / K) + 0.5 * sigma_eff**2 * T) / (sigma_eff * np.sqrt(T))
@@ -357,19 +349,12 @@ def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    # Standard GEX = Gamma * Spot^2 * Open Interest 
     return gamma * oi * (S ** 2)
 
 ###########################################
 # EV Calculation Functions (Adjusted for Risk)
 ###########################################
 def adjust_ev(ev_value, position_side):
-    """
-    Adjust the EV value based on position side.
-    For "long" volatility positions (buying options), flip the sign so that a positive
-    number represents a favorable expected profit from the buyer's perspective.
-    For "short" volatility positions, the value is unchanged.
-    """
     if position_side.lower() == "long":
         return -ev_value
     else:
@@ -392,7 +377,6 @@ def calculate_atm_straddle_ev(ticker_list, spot_price, T, rv, position_side="sho
     for strike, data in atm_strikes.items():
         avg_iv = data["iv_sum"] / data["count"]
         ev_value = (((avg_iv**2 - rv**2) * T) / 2) * 100
-        # Adjust EV by dividing by risk_factor to penalize higher risk environments
         ev_value = ev_value / risk_factor if 'risk_factor' in globals() else ev_value
         ev_value = adjust_ev(ev_value, position_side)
         ev_candidates.append({"Strike": strike, "Avg IV": avg_iv, "EV (%)": ev_value})
@@ -498,9 +482,6 @@ def calculate_small_atm_straddle_ev(ticker_list, spot_price, T, rv, position_sid
 # DYNAMIC VOLATILITY ADJUSTMENT USING VOLATILITY SMILE
 ###########################################
 def adjust_volatility_with_smile(strike, smile_df):
-    """
-    Adjust the implied volatility for a given strike based on the observed volatility smile.
-    """
     sorted_smile = smile_df.sort_values("strike")
     strikes = sorted_smile["strike"].values
     ivs = sorted_smile["iv"].values
@@ -557,7 +538,6 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
         raw_iv = ticker_data.get("iv", None)
         if raw_iv is None:
             continue
-        # Adjust IV using the observed volatility smile
         adjusted_iv = adjust_volatility_with_smile(strike, smile_df)
         try:
             d1 = (np.log(spot / strike) + 0.5 * adjusted_iv**2 * T) / (adjusted_iv * np.sqrt(T))
@@ -581,7 +561,8 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
                            historical_vols=None, historical_vrps=None, expiry_date=None):
     current_date = dt.datetime.now()
     days_to_expiration = (expiry_date - current_date).days if expiry_date else 7
-    rv_vol_series = calculate_parkinson_volatility(df_kraken, window_days=days_to_expiration)
+    # Use the new realized volatility calculation (EWMA Roger-Satchell)
+    rv_vol_series = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
     rv_vol = rv_vol_series.iloc[-1] if not rv_vol_series.empty else np.nan
     iv_vol = df["iv_close"].mean() if not df.empty else np.nan
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
@@ -840,7 +821,7 @@ def main():
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
 
-    daily_rv = compute_daily_realized_volatility(df_kraken)
+    daily_rv = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
     daily_iv = compute_daily_average_iv(df_iv_agg)
     historical_vrps = compute_historical_vrp(daily_iv, daily_rv)
 
@@ -871,7 +852,7 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
 
-    rv_series = calculate_parkinson_volatility(df_kraken, window_days=7, annualize_days=365)
+    rv_series = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
     if position in ["ATM Straddle", "Leveraged Long Straddle"]:
