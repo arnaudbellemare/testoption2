@@ -14,7 +14,7 @@ from scipy.interpolate import CubicSpline
 ###########################################
 # Global settings
 ###########################################
-CONTRACT_SIZE = 1  # Set the contract size as needed
+
 
 ###########################################
 # Thalex API details
@@ -369,8 +369,8 @@ def compute_gex(row, S, oi):
     gamma = compute_gamma(row, S)
     if gamma is None or np.isnan(gamma):
         return np.nan
-    # Standard GEX = Gamma * Spot^2 * OpenInterest * CONTRACT_SIZE
-    return gamma * oi * (S ** 2) * CONTRACT_SIZE
+    # Standard GEX = Gamma * Spot^2 * OpenInterest 
+    return gamma * oi * (S ** 2) 
 
 ###########################################
 # GAMMA & GEX VISUALIZATIONS
