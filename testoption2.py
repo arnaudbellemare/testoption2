@@ -299,6 +299,15 @@ def compute_daily_realized_volatility(df, span=30, annualize_days=365):
     daily_vol_annualized = daily_vol * np.sqrt(annualize_days)
     return daily_vol_annualized
 
+# NEW: Function to compute daily average IV from aggregated IV DataFrame
+def compute_daily_average_iv(df_iv_agg):
+    daily_iv = df_iv_agg["iv_mean"].resample("D").mean(numeric_only=True).dropna().tolist()
+    return daily_iv
+
+def compute_historical_vrp(daily_iv, daily_rv):
+    n = min(len(daily_iv), len(daily_rv))
+    return [(iv ** 2) - (rv ** 2) for iv, rv in zip(daily_iv[:n], daily_rv[:n])]
+
 ###########################################
 # Option Delta and Gamma Calculation (Adjusted)
 ###########################################
