@@ -669,19 +669,44 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
 ###########################################
 # UPDATED TRADE STRATEGY EVALUATION
 ###########################################
+###########################################
+# UPDATED TRADE STRATEGY EVALUATION
+###########################################
 def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg_reset=None,
-                            historical_vols=None, historical_vrps=None, days_to_expiration=7):
-    rv_vol_series = calculate_parkinson_volatility(df_kraken, window_days=7)
+                           historical_vols=None, historical_vrps=None, expiry_date=None):
+    """
+    Evaluates the optimal trading strategy based on volatility metrics, market regime, and risk tolerance.
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing option data (IV, strikes, etc.).
+        spot_price (float): Current spot price of the underlying asset.
+        risk_tolerance (str): Risk tolerance level ("Conservative", "Moderate", "Aggressive").
+        df_iv_agg_reset (pd.DataFrame): DataFrame with aggregated IV data.
+        historical_vols (list): Historical realized volatility values.
+        historical_vrps (list): Historical VRP values.
+        expiry_date (datetime): Expiration date of the option.
+    
+    Returns:
+        dict: A dictionary containing trading recommendations, volatility metrics, and market regime.
+    """
+    # Calculate days to expiration dynamically
+    current_date = dt.datetime.now()
+    days_to_expiration = (expiry_date - current_date).days if expiry_date else 7  # Default to 7 if expiry_date is None
+
+    # Calculate RV using a window matching the option's time to expiration
+    rv_vol_series = calculate_parkinson_volatility(df_kraken, window_days=days_to_expiration)
     rv_vol = rv_vol_series.iloc[-1] if not rv_vol_series.empty else np.nan
     iv_vol = df["iv_close"].mean() if not df.empty else np.nan
 
+    # Compute variance and VRP
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
     iv_var = iv_vol ** 2 if not pd.isna(iv_vol) else np.nan
-    current_vrp = iv_var - rv_var if (not pd.isna(iv_vol) and not pd.isna(rv_vol)) else np.nan
+    current_vrp = iv_var - rv_var if (not pd.isna(iv_vol) and (not pd.isna(rv_vol)) else np.nan
 
+    # Check for IV-RV divergence
     divergence = abs(iv_vol - rv_vol) / rv_vol if (rv_vol != 0 and not pd.isna(iv_vol)) else np.nan
     if not np.isnan(divergence) and divergence > 0.20:
-        st.write(f"Alert: IV and RV diverge by {divergence*100:.2f}% (threshold: 20%).")
+        st.write(f"Alert: IV and RV diverge by {divergence * 100:.2f}% (threshold: 20%).")
 
     # Compute rolling 1-day IV statistics for market regime determination
     df_iv_agg = df.groupby("date_time")["iv_close"].mean().to_frame(name="iv_mean")
@@ -694,6 +719,8 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     latest_iv = df_iv_agg["iv_mean"].iloc[-1]
     latest_upper = df_iv_agg["upper_zone"].iloc[-1]
     latest_lower = df_iv_agg["lower_zone"].iloc[-1]
+
+    # Determine market regime based on IV
     if latest_iv > latest_upper:
         market_regime = "Risk-Off"
     elif latest_iv < latest_lower:
@@ -701,8 +728,11 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     else:
         market_regime = "Neutral"
     vol_regime = market_regime
+
+    # Classify VRP regime
     vrp_regime = classify_vrp_regime(current_vrp, historical_vrps) if historical_vrps and len(historical_vrps) > 0 else "Neutral"
 
+    # Calculate average delta and gamma for calls and puts
     call_items = [item for item in ticker_list if item["option_type"] == "C"]
     put_items = [item for item in ticker_list if item["option_type"] == "P"]
     call_oi_total = sum(item["open_interest"] for item in call_items)
@@ -710,11 +740,13 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     avg_call_delta = (sum(item["delta"] * item["open_interest"] for item in call_items) / call_oi_total) if call_oi_total > 0 else 0
     avg_put_delta = (sum(item["delta"] * item["open_interest"] for item in put_items) / put_oi_total) if put_oi_total > 0 else 0
 
+    # Compute put/call open interest ratio
     df_ticker = pd.DataFrame(ticker_list) if ticker_list else pd.DataFrame()
     call_oi = df_ticker[df_ticker["option_type"] == "C"]["open_interest"].sum() if not df_ticker.empty else 0
     put_oi = df_ticker[df_ticker["option_type"] == "P"]["open_interest"].sum() if not df_ticker.empty else 0
     put_call_ratio = put_oi / call_oi if call_oi > 0 else np.inf
 
+    # Calculate gamma for calls and puts
     df_calls = df[df["option_type"] == "C"].copy()
     df_puts = df[df["option_type"] == "P"].copy()
     if "gamma" not in df_calls.columns:
@@ -724,7 +756,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     avg_call_gamma = df_calls["gamma"].mean() if not df_calls.empty else 0
     avg_put_gamma = df_puts["gamma"].mean() if not df_puts.empty else 0
 
-    # Determine trading recommendation based on VRP regime and risk tolerance.
+    # Determine trading recommendation based on VRP regime and risk tolerance
     if vrp_regime == "Long Volatility":
         if risk_tolerance == "Conservative":
             recommendation = "Long Volatility (Conservative): Buy limited OTM Puts"
