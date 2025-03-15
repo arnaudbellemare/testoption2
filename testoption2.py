@@ -57,20 +57,39 @@ COLUMNS = [
 ]
 
 ###########################################
-# Risk Adjustment Function
+# Sophisticated Risk Adjustment using Cornish-Fisher
 ###########################################
-def compute_risk_adjustment_factor(df):
+def compute_risk_adjustment_factor_cf(df, alpha=0.05):
     """
-    Computes a risk adjustment factor based on the excess kurtosis
-    of historical returns from Kraken data.
-    This factor is used to adjust volatility measures in crypto markets.
+    Computes a risk adjustment factor using the Cornish-Fisher expansion.
+    
+    Parameters:
+      df: DataFrame containing at least a 'close' column.
+      alpha: Significance level (e.g., 0.05 for 95% VaR).
+      
+    The function calculates the standardized skewness (S) and kurtosis (K) of the return series.
+    Here, we assume that df['return'] = df['close'].pct_change() gives excess kurtosis (i.e., kurtosis - 3).
+    We then convert it to the full kurtosis by adding 3.
+    
+    The Cornish-Fisher expansion adjusts the quantile as follows:
+      z_cf = z + (z^2 - 1)*S/6 + (z^3 - 3*z)*(K - 3)/24 - (2*z^3 - 5*z)*(S^2)/36
+    where z is the standard normal quantile for the chosen alpha.
+    
+    The risk factor is then defined as the absolute ratio |z_cf / z|.
+    A risk factor >1 indicates that the adjusted quantile (accounting for fat tails and asymmetry)
+    is larger in magnitude, hence volatility should be scaled up.
     """
     df = df.copy()
     if "close" not in df.columns:
         return 1.0
-    df['return'] = df['close'].pct_change()
-    kurt = df['return'].kurtosis()  # Excess kurtosis (for a normal dist., this is ~0)
-    risk_factor = 1 + max(0, kurt / 10)  # Simple scaling: if kurtosis is high, risk_factor > 1
+    returns = df['close'].pct_change().dropna()
+    S = returns.skew()      # Standardized skewness
+    # If pandas returns excess kurtosis (which is typical), add 3 to get full kurtosis.
+    K = returns.kurtosis() + 3  
+    z = norm.ppf(alpha)     # Standard normal quantile (e.g., ~ -1.645 for alpha=0.05)
+    # Cornish-Fisher adjusted quantile
+    z_cf = z + (z**2 - 1)*S/6 + (z**3 - 3*z)*(K - 3)/24 - (2*z**3 - 5*z)*(S**2)/36
+    risk_factor = abs(z_cf / z) if z != 0 else 1.0
     return risk_factor
 
 ###########################################
@@ -299,7 +318,9 @@ def compute_daily_realized_volatility(df, span=30, annualize_days=365):
     daily_vol_annualized = daily_vol * np.sqrt(annualize_days)
     return daily_vol_annualized
 
-# NEW: Function to compute daily average IV from aggregated IV DataFrame
+###########################################
+# New: Compute Daily Average IV
+###########################################
 def compute_daily_average_iv(df_iv_agg):
     daily_iv = df_iv_agg["iv_mean"].resample("D").mean(numeric_only=True).dropna().tolist()
     return daily_iv
@@ -773,10 +794,10 @@ def main():
     spot_price = df_kraken["close"].iloc[-1]
     st.write(f"Current BTC/USD Price: {spot_price:.2f}")
 
-    # Compute risk adjustment factor from historical data
+    # Compute risk adjustment factor using the Cornish-Fisher approach
     global risk_factor
-    risk_factor = compute_risk_adjustment_factor(df_kraken)
-    st.write(f"Risk Adjustment Factor: {risk_factor:.2f}")
+    risk_factor = compute_risk_adjustment_factor_cf(df_kraken, alpha=0.05)
+    st.write(f"Risk Adjustment Factor (CF): {risk_factor:.2f}")
 
     try:
         filtered_calls, filtered_puts = get_filtered_instruments(spot_price, expiry_str, T_YEARS, multiplier)
