@@ -12,9 +12,8 @@ import math
 from scipy.interpolate import CubicSpline
 
 ###########################################
-# Global settings
+# Global Settings
 ###########################################
-
 BASE_URL = "https://thalex.com/api/v2/public"
 instruments_endpoint = "instruments"  # Endpoint for fetching available instruments
 url_instruments = f"{BASE_URL}/{instruments_endpoint}"
@@ -23,15 +22,14 @@ url_mark_price = f"{BASE_URL}/{mark_price_endpoint}"
 TICKER_ENDPOINT = "ticker"
 URL_TICKER = f"{BASE_URL}/{TICKER_ENDPOINT}"
 
-# Dictionary for rolling window configuration
-windows = {"7D": "vrp_7d"}
-DEFAULT_EXPIRY_STR = "28MAR25"
-
-# Calculate time to expiry using default expiry
+DEFAULT_EXPIRY_STR = "28MAR25"  # Expected format: %d%b%y
 expiry_date = dt.datetime.strptime(DEFAULT_EXPIRY_STR, "%d%b%y")
 current_date = dt.datetime.now()
 days_to_expiry = (expiry_date - current_date).days
 T_YEARS = days_to_expiry / 365
+
+# Dictionary for rolling window configuration (if needed later)
+windows = {"7D": "vrp_7d"}
 
 def params(instrument_name):
     now = dt.datetime.now()
@@ -67,28 +65,19 @@ def compute_risk_adjustment_factor_cf(df, alpha=0.05):
       df: DataFrame containing at least a 'close' column.
       alpha: Significance level (e.g., 0.05 for 95% VaR).
       
-    The function calculates the standardized skewness (S) and kurtosis (K) of the return series.
-    Here, we assume that df['return'] = df['close'].pct_change() gives excess kurtosis (i.e., kurtosis - 3).
-    We then convert it to the full kurtosis by adding 3.
-    
-    The Cornish-Fisher expansion adjusts the quantile as follows:
-      z_cf = z + (z^2 - 1)*S/6 + (z^3 - 3*z)*(K - 3)/24 - (2*z^3 - 5*z)*(S^2)/36
-    where z is the standard normal quantile for the chosen alpha.
-    
-    The risk factor is then defined as the absolute ratio |z_cf / z|.
-    A risk factor >1 indicates that the adjusted quantile (accounting for fat tails and asymmetry)
-    is larger in magnitude, hence volatility should be scaled up.
+    Returns:
+      A risk adjustment factor as the absolute ratio |z_cf / z|.
     """
     df = df.copy()
     if "close" not in df.columns:
         return 1.0
     returns = df['close'].pct_change().dropna()
     S = returns.skew()      # Standardized skewness
-    # If pandas returns excess kurtosis (which is typical), add 3 to get full kurtosis.
+    # Adjust for full kurtosis (pandas usually gives excess kurtosis)
     K = returns.kurtosis() + 3  
     z = norm.ppf(alpha)     # Standard normal quantile (e.g., ~ -1.645 for alpha=0.05)
     # Cornish-Fisher adjusted quantile
-    z_cf = z + (z**2 - 1)*S/6 + (z**3 - 3*z)*(K - 3)/24 - (2*z**3 - 5*z)*(S**2)/36
+    z_cf = z + (z**2 - 1) * S / 6 + (z**3 - 3*z) * (K - 3) / 24 - (2*z**3 - 5*z) * (S**2) / 36
     risk_factor = abs(z_cf / z) if z != 0 else 1.0
     return risk_factor
 
@@ -193,6 +182,7 @@ def get_filtered_instruments(spot_price, expiry_str=DEFAULT_EXPIRY_STR, t_years=
     puts_all = get_option_instruments(instruments_list, "P", expiry_str)
     if not calls_all:
         raise Exception(f"No call instruments found for expiry {expiry_str}.")
+    
     strike_list = []
     for inst in calls_all:
         parts = inst.split("-")
@@ -202,13 +192,12 @@ def get_filtered_instruments(spot_price, expiry_str=DEFAULT_EXPIRY_STR, t_years=
         raise Exception(f"No valid call instruments with strikes found for expiry {expiry_str}.")
     strike_list.sort(key=lambda x: x[1])
     strikes = [s for _, s in strike_list]
-    if not strikes:
-        raise Exception("No strikes available for filtering.")
     closest_index = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot_price))
     nearest_instrument = strike_list[closest_index][0]
     actual_iv = get_actual_iv(nearest_instrument)
     if actual_iv is None:
         raise Exception("Could not fetch actual IV for the nearest instrument.")
+    
     lower_bound = spot_price * np.exp(-actual_iv * np.sqrt(t_years) * multiplier)
     upper_bound = spot_price * np.exp(actual_iv * np.sqrt(t_years) * multiplier)
     filtered_calls = [inst for inst in calls_all if lower_bound <= int(inst.split("-")[2]) <= upper_bound]
@@ -239,8 +228,8 @@ def fetch_data(instruments_tuple):
         .assign(date_time=lambda df: pd.to_datetime(df["ts"], unit="s")
                 .dt.tz_localize("UTC")
                 .dt.tz_convert("America/New_York"))
-        .assign(k=lambda df: df["instrument_name"].map(lambda s: int(s.split("-")[2])
-                                                      if len(s.split("-")) >= 3 and s.split("-")[2].isdigit() else np.nan))
+        .assign(k=lambda df: df["instrument_name"].map(
+            lambda s: int(s.split("-")[2]) if len(s.split("-")) >= 3 and s.split("-")[2].isdigit() else np.nan))
         .assign(option_type=lambda df: df["instrument_name"].str.split("-").str[-1])
     )
     return df
@@ -278,7 +267,7 @@ def fetch_kraken_data():
 ###########################################
 # EWMA-ROGER SATCHELL VOLATILITY CALCULATION
 ###########################################
-def calculate_ewma_roger_satchell_volatility(price_data, span=days_to_expiration):
+def calculate_ewma_roger_satchell_volatility(price_data, span=days_to_expiry):
     """
     Calculate realized volatility using the Roger-Satchell estimator with an EWMA.
     Assumes price_data has columns: 'open', 'high', 'low', 'close'.
@@ -296,25 +285,31 @@ def compute_realized_volatility_5min(df, annualize_days=365):
     Annualizes based on the number of 5-minute intervals in a year.
     """
     df = df.copy()
-    # Calculate RS for each 5-minute interval
     df['rs'] = (np.log(df['high'] / df['close']) * np.log(df['high'] / df['open']) +
                 np.log(df['low'] / df['close']) * np.log(df['low'] / df['open']))
     total_variance = df['rs'].sum()
     if total_variance <= 0:
         return 0.0
-    # Number of 5-minute intervals in the data
     N = len(df)
     if N == 0:
         return 0.0
-    # Number of 5-minute intervals in a year
-    M = annualize_days * 24 * 12  # 12 intervals per hour
+    # Number of 5-minute intervals in a year (assuming 24h trading)
+    M = annualize_days * 24 * 12
     annualization_factor = np.sqrt(M / N)
     realized_vol = np.sqrt(total_variance) * annualization_factor
     return realized_vol
 
+def compute_daily_realized_volatility(df, span=30, annualize_days=365):
+    """
+    Aggregates realized volatility from 5-minute intervals to daily values.
+    """
+    df = df.copy()
+    df["date"] = df["date_time"].dt.date
+    daily_vol = df.groupby("date").apply(lambda x: compute_realized_volatility_5min(x, annualize_days))
+    return daily_vol
 
 ###########################################
-# New: Compute Daily Average IV
+# NEW: Compute Daily Average IV and Historical VRP
 ###########################################
 def compute_daily_average_iv(df_iv_agg):
     daily_iv = df_iv_agg["iv_mean"].resample("D").mean(numeric_only=True).dropna().tolist()
@@ -325,7 +320,7 @@ def compute_historical_vrp(daily_iv, daily_rv):
     return [(iv ** 2) - (rv ** 2) for iv, rv in zip(daily_iv[:n], daily_rv[:n])]
 
 ###########################################
-# Option Delta and Gamma Calculation (Adjusted)
+# OPTION DELTA AND GAMMA CALCULATION (ADJUSTED)
 ###########################################
 def compute_delta(row, S):
     try:
@@ -377,7 +372,7 @@ def compute_gex(row, S, oi):
     return gamma * oi * (S ** 2)
 
 ###########################################
-# EV Calculation Functions (Adjusted for Risk)
+# EV CALCULATION FUNCTIONS (ADJUSTED FOR RISK)
 ###########################################
 def adjust_ev(ev_value, position_side):
     if position_side.lower() == "long":
@@ -583,7 +578,7 @@ def build_ticker_list(all_instruments, spot, T, smile_df):
 # UPDATED TRADE STRATEGY EVALUATION
 ###########################################
 def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg_reset=None,
-                           historical_vols=None, historical_vrps=None, expiry_date=None):
+                            historical_vols=None, historical_vrps=None, expiry_date=None):
     current_date = dt.datetime.now()
     days_to_expiration = (expiry_date - current_date).days if expiry_date else 7
     # Use the new realized volatility calculation (EWMA Roger-Satchell)
@@ -596,6 +591,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
     divergence = abs(iv_vol - rv_vol) / rv_vol if (rv_vol != 0 and not pd.isna(iv_vol)) else np.nan
     if not np.isnan(divergence) and divergence > 0.20:
         st.write(f"Alert: IV and RV diverge by {divergence * 100:.2f}% (threshold: 20%).")
+    
     df_iv_agg = df.groupby("date_time")["iv_close"].mean().to_frame(name="iv_mean")
     df_iv_agg.index = pd.to_datetime(df_iv_agg.index)
     df_iv_agg = df_iv_agg.resample("5min").mean().ffill().sort_index()
@@ -614,16 +610,20 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
         market_regime = "Neutral"
     vol_regime = market_regime
     vrp_regime = classify_vrp_regime(current_vrp, historical_vrps) if historical_vrps and len(historical_vrps) > 0 else "Neutral"
+    
+    # Split ticker list into calls and puts
     call_items = [item for item in ticker_list if item["option_type"] == "C"]
     put_items = [item for item in ticker_list if item["option_type"] == "P"]
     call_oi_total = sum(item["open_interest"] for item in call_items)
     put_oi_total = sum(item["open_interest"] for item in put_items)
     avg_call_delta = (sum(item["delta"] * item["open_interest"] for item in call_items) / call_oi_total) if call_oi_total > 0 else 0
     avg_put_delta = (sum(item["delta"] * item["open_interest"] for item in put_items) / put_oi_total) if put_oi_total > 0 else 0
+    
     df_ticker = pd.DataFrame(ticker_list) if ticker_list else pd.DataFrame()
     call_oi = df_ticker[df_ticker["option_type"] == "C"]["open_interest"].sum() if not df_ticker.empty else 0
     put_oi = df_ticker[df_ticker["option_type"] == "P"]["open_interest"].sum() if not df_ticker.empty else 0
     put_call_ratio = put_oi / call_oi if call_oi > 0 else np.inf
+
     df_calls = df[df["option_type"] == "C"].copy()
     df_puts = df[df["option_type"] == "P"].copy()
     if "gamma" not in df_calls.columns:
@@ -632,6 +632,8 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
         df_puts["gamma"] = df_puts.apply(lambda row: compute_gamma(row, spot_price), axis=1)
     avg_call_gamma = df_calls["gamma"].mean() if not df_calls.empty else 0
     avg_put_gamma = df_puts["gamma"].mean() if not df_puts.empty else 0
+    
+    # Determine trading recommendation based on volatility regimes and risk tolerance
     if vrp_regime == "Long Volatility":
         if risk_tolerance == "Conservative":
             recommendation = "Long Volatility (Conservative): Buy limited OTM Puts"
@@ -662,6 +664,7 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
         recommendation = "Gamma Scalping (Neutral): Consider buying small ATM straddles"
         position = "Small ATM Straddle"
         hedge_action = "Implement light delta hedging"
+    
     return {
         "recommendation": recommendation,
         "position": position,
@@ -728,7 +731,6 @@ def plot_net_gex(df_gex, spot_price):
         x="strike",
         y="net_gex",
         color="sign",
-        color_discrete_map={"Negative": "orange", "Positive": "blue"},
         title="Net Gamma Exposure (Calls GEX - Puts GEX)",
         labels={"net_gex": "Net GEX", "strike": "Strike Price"}
     )
@@ -789,7 +791,7 @@ def main():
     spot_price = df_kraken["close"].iloc[-1]
     st.write(f"Current BTC/USD Price: {spot_price:.2f}")
 
-    # Compute risk adjustment factor using the Cornish-Fisher approach
+    # Compute risk adjustment factor using Cornish-Fisher
     global risk_factor
     risk_factor = compute_risk_adjustment_factor_cf(df_kraken, alpha=0.05)
     st.write(f"Risk Adjustment Factor (CF): {risk_factor:.2f}")
@@ -846,7 +848,9 @@ def main():
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
 
-    daily_rv = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
+    # Compute realized volatility series and convert daily series to list for historical VRP
+    daily_rv_series = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
+    daily_rv = daily_rv_series.tolist()
     daily_iv = compute_daily_average_iv(df_iv_agg)
     historical_vrps = compute_historical_vrp(daily_iv, daily_rv)
 
@@ -857,7 +861,7 @@ def main():
 
     trade_decision = evaluate_trade_strategy(
         df, spot_price, risk_tolerance, df_iv_agg_reset,
-        historical_vols=daily_rv,
+        historical_vols=daily_rv_series,
         historical_vrps=historical_vrps,
         expiry_date=expiry_date
     )
