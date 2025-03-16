@@ -278,45 +278,40 @@ def fetch_kraken_data():
 ###########################################
 # EWMA-ROGER SATCHELL VOLATILITY CALCULATION
 ###########################################
-def calculate_ewma_roger_satchell_volatility(price_data, span=30):
+def calculate_ewma_roger_satchell_volatility(price_data, span=days_to_expiration):
     """
     Calculate realized volatility using the Roger-Satchell estimator with an EWMA.
     Assumes price_data has columns: 'open', 'high', 'low', 'close'.
     """
     df = price_data.copy()
-    # Compute the Roger-Satchell estimator for each day
     df['rs'] = (np.log(df['high'] / df['close']) * np.log(df['high'] / df['open']) +
                 np.log(df['low'] / df['close']) * np.log(df['low'] / df['open']))
-    # Apply EWMA on the RS series
     ewma_rs = df['rs'].ewm(span=span, adjust=False).mean()
-    # Ensure non-negative values and compute volatility as the square root
     volatility = np.sqrt(ewma_rs.clip(lower=0))
     return volatility
 
-def compute_daily_realized_volatility(df, span=30, annualize_days=365):
+def compute_realized_volatility_5min(df, annualize_days=365):
     """
-    Resample the data daily using OHLC (open, high, low, close), then compute the
-    realized volatility using the EWMA of the Roger-Satchell estimator. The result is annualized.
+    Compute realized volatility using 5-minute data with the Roger-Satchell estimator.
+    Annualizes based on the number of 5-minute intervals in a year.
     """
-    if 'date_time' in df.columns:
-        df_daily = df.resample('D', on='date_time').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last'
-        }).dropna()
-    else:
-        df_daily = df.resample('D').agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last'
-        }).dropna()
-    # Calculate daily volatility using EWMA Roger-Satchell
-    daily_vol = calculate_ewma_roger_satchell_volatility(df_daily, span=span)
-    # Annualize the volatility
-    daily_vol_annualized = daily_vol * np.sqrt(annualize_days)
-    return daily_vol_annualized
+    df = df.copy()
+    # Calculate RS for each 5-minute interval
+    df['rs'] = (np.log(df['high'] / df['close']) * np.log(df['high'] / df['open']) +
+                np.log(df['low'] / df['close']) * np.log(df['low'] / df['open']))
+    total_variance = df['rs'].sum()
+    if total_variance <= 0:
+        return 0.0
+    # Number of 5-minute intervals in the data
+    N = len(df)
+    if N == 0:
+        return 0.0
+    # Number of 5-minute intervals in a year
+    M = annualize_days * 24 * 12  # 12 intervals per hour
+    annualization_factor = np.sqrt(M / N)
+    realized_vol = np.sqrt(total_variance) * annualization_factor
+    return realized_vol
+
 
 ###########################################
 # New: Compute Daily Average IV
