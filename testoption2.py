@@ -299,21 +299,44 @@ def compute_realized_volatility_5min(df, annualize_days=365):
     realized_vol = np.sqrt(total_variance) * annualization_factor
     return realized_vol
 
-def compute_daily_realized_volatility(df, span=30, annualize_days=365):
+###########################################
+# BTC DAILY ANNUALIZED REALIZED VOLATILITY CALCULATION
+###########################################
+def calculate_btc_annualized_volatility_daily(df):
     """
-    Aggregates realized volatility from 5-minute intervals to daily values.
-    If 'date_time' column is not available, the function resets the index assuming it's a DatetimeIndex.
+    Calculates the annualized realized volatility of BTC using the last 30 days of daily percentage returns.
     """
-    df = df.copy()
+    # Ensure the DataFrame has a 'date_time' column
     if "date_time" not in df.columns:
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.reset_index()  # Convert the index to a column named 'date_time'
         else:
             raise KeyError("No 'date_time' column found and index is not a DatetimeIndex.")
-    df["date"] = df["date_time"].dt.date
-    daily_vol = df.groupby("date").apply(lambda x: compute_realized_volatility_5min(x, annualize_days))
-    return daily_vol
+    # Resample to daily data using the last available close price of each day
+    df_daily = df.set_index("date_time").resample("D").last().dropna(subset=["close"])
+    # Calculate daily percentage returns
+    df_daily["daily_return"] = df_daily["close"].pct_change()
+    # Get the last 30 days of returns
+    last_30_returns = df_daily["daily_return"].dropna().tail(30)
+    if last_30_returns.empty:
+        return np.nan
+    daily_std = last_30_returns.std()
+    annualized_vol = daily_std * np.sqrt(365)
+    return annualized_vol
 
+def calculate_daily_realized_volatility_series(df):
+    """
+    Calculates a daily series of realized volatility using the daily percentage returns over a 30-day rolling window.
+    """
+    if "date_time" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()
+        else:
+            raise KeyError("No 'date_time' column found and index is not a DatetimeIndex.")
+    df_daily = df.set_index("date_time").resample("D").last().dropna(subset=["close"])
+    df_daily["daily_return"] = df_daily["close"].pct_change()
+    volatility_series = df_daily["daily_return"].rolling(window=30).std() * np.sqrt(365)
+    return volatility_series.dropna()
 
 ###########################################
 # NEW: Compute Daily Average IV and Historical VRP
@@ -588,9 +611,8 @@ def evaluate_trade_strategy(df, spot_price, risk_tolerance="Moderate", df_iv_agg
                             historical_vols=None, historical_vrps=None, expiry_date=None):
     current_date = dt.datetime.now()
     days_to_expiration = (expiry_date - current_date).days if expiry_date else 7
-    # Use the new realized volatility calculation (EWMA Roger-Satchell)
-    rv_vol_series = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
-    rv_vol = rv_vol_series.iloc[-1] if not rv_vol_series.empty else np.nan
+    # Calculate realized volatility using the new daily percentage returns method
+    rv_vol = calculate_btc_annualized_volatility_daily(df_kraken)
     iv_vol = df["iv_close"].mean() if not df.empty else np.nan
     rv_var = rv_vol ** 2 if not pd.isna(rv_vol) else np.nan
     iv_var = iv_vol ** 2 if not pd.isna(iv_vol) else np.nan
@@ -855,8 +877,10 @@ def main():
     global ticker_list
     ticker_list = build_ticker_list(all_instruments, spot_price, T_YEARS, smile_df)
 
-    # Compute realized volatility series and convert daily series to list for historical VRP
-    daily_rv_series = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
+    # Compute realized volatility using the new daily returns method
+    rv_vol = calculate_btc_annualized_volatility_daily(df_kraken)
+    # For historical VRP, compute daily realized volatility series
+    daily_rv_series = calculate_daily_realized_volatility_series(df_kraken)
     daily_rv = daily_rv_series.tolist()
     daily_iv = compute_daily_average_iv(df_iv_agg)
     historical_vrps = compute_historical_vrp(daily_iv, daily_rv)
@@ -888,7 +912,7 @@ def main():
     st.write(f"**Position:** {trade_decision['position']}")
     st.write(f"**Hedge Action:** {trade_decision['hedge_action']}")
 
-    rv_series = compute_daily_realized_volatility(df_kraken, span=30, annualize_days=365)
+    rv_series = calculate_daily_realized_volatility_series(df_kraken)
     rv_scalar = rv_series.iloc[-1] if not rv_series.empty else np.nan
     position = trade_decision['position']
     if position in ["ATM Straddle", "Leveraged Long Straddle"]:
