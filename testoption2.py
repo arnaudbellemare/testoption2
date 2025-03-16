@@ -302,11 +302,18 @@ def compute_realized_volatility_5min(df, annualize_days=365):
 def compute_daily_realized_volatility(df, span=30, annualize_days=365):
     """
     Aggregates realized volatility from 5-minute intervals to daily values.
+    If 'date_time' column is not available, the function resets the index assuming it's a DatetimeIndex.
     """
     df = df.copy()
+    if "date_time" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()  # Convert the index to a column named 'date_time'
+        else:
+            raise KeyError("No 'date_time' column found and index is not a DatetimeIndex.")
     df["date"] = df["date_time"].dt.date
     daily_vol = df.groupby("date").apply(lambda x: compute_realized_volatility_5min(x, annualize_days))
     return daily_vol
+
 
 ###########################################
 # NEW: Compute Daily Average IV and Historical VRP
